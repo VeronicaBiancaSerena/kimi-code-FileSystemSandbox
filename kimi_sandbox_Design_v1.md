@@ -1669,11 +1669,20 @@ v2 用一个**纯标准库**构建的 classic-BPF（cBPF）程序关闭该残留
 - 过滤器逻辑：校验 `seccomp_data.arch` → 校验 syscall 号为 `ioctl` →
   比较 `args[1]` 低 32 位，命中 `TIOCSTI(0x5412)`/`TIOCLINUX(0x541c)` 返回
   `SECCOMP_RET_ERRNO|EPERM`，其余 `SECCOMP_RET_ALLOW`。
-- 支持架构：`x86_64`、`aarch64`（ioctl 号分别为 16、29）。未知架构时**降级为不安装**
+- 支持架构：`x86_64`、`aarch64`（原生 ioctl 号分别为 16、29）。未知架构时**降级为不安装**
   并打印 note（而非拒绝启动）。
+- **多 ABI 加固（第三轮评审 R3，见 §39.12）**：单纯只校验原生 `arch` 而对其它
+  arch 一律 `ALLOW`，会被「切换 syscall ABI」绕过——x86_64 内核在 IA32 仿真下可经
+  i386（`int 0x80`）或 x32 ABI 发起 `ioctl`，其 syscall 号与 x86_64 不同，从而绕过单一
+  arch 过滤器。整改后过滤器枚举该机器内核会接受的**全部 ABI** 并逐一拦截终端 ioctl：
+  x86_64 覆盖 x86_64（nr 16）、x32（nr `0x40000000|16`）、i386（nr 54）；aarch64 覆盖
+  aarch64（nr 29）与 32 位 ARM（nr 54）。任何不在枚举内的 arch 值一律按 `EPERM` **拒绝**
+  而非放行，杜绝换 ABI 逃逸。cBPF 跳转偏移用「标签 + 两遍解析」生成，避免手算偏移出错。
 - 通过 `bwrap --seccomp <fd>` 传入；fd 由 `mkstemp`→`open`→`unlink` 得到，
   `set_inheritable(True)` 后经 `subprocess.run(..., pass_fds=(fd,))` 继承。
-- 默认开启；`--no-seccomp` 关闭。已验证：开启时 ioctl 返回 `EPERM`，关闭时不再拦截。
+- 默认开启；`--no-seccomp` 关闭。已验证：开启时 ioctl 返回 `EPERM`，关闭时不再拦截；
+  并以内置微型 cBPF 解释器（`test_seccomp.py`）证明原生/x32/i386/arm 命中拦截、其它
+  ioctl 放行、外来 arch 被拒。
 
 ### 39.2 网络隔离 `--no-network`（对应 §33.4）
 
@@ -1727,10 +1736,14 @@ v2 用一个**纯标准库**构建的 classic-BPF（cBPF）程序关闭该残留
 
 ### 39.9 测试现状
 
-- 单元测试 136 项全绿（新增 `test_seccomp.py`、`test_paths_v2.py`、`test_bwrap_v2.py`、
-  `test_cli_v2.py`；含第二轮评审 R1/R2/C1 的回归用例）。
+- 单元测试 144 项全绿（新增 `test_seccomp.py`、`test_paths_v2.py`、`test_bwrap_v2.py`、
+  `test_cli_v2.py`；含第二轮评审 R1/R2/C1 与第三轮评审 R3/R4 的回归用例）。
+  其中 `test_seccomp.py` 内置微型 cBPF 解释器，对多 ABI 拦截行为做**行为级**证明
+  （而非仅检查指令形状）。
 - smoke 21 项全绿（真实 bubblewrap 0.11.1：原 §28 验收 + 9 项 v2 功能
   + 1 项 R1 反向覆盖回归；网络可达性探测对外部依赖做有限重试）。
+- CI（`.github/workflows/ci.yml`）在 Python 3.11–3.13 跑单测矩阵，并安装 bubblewrap
+  做一次 `--dry-run` 健全性检查（不真正启动 kimi）。
 
 ### 39.10 仍未触碰的 v1 底线（§37）
 
@@ -1761,3 +1774,32 @@ v2 全程遵守 §37：不挂真实 HOME、不挂真实 `~/.kimi-code`、不 `--
 其余次要项（D1 TIOCSTI 文案、S1 rw-mount source 广度、Q1 machine name 双来源、
 D2 README 漏 `state_root` 等）评级为信息/装饰级，未在本轮改动，留待后续。本轮整改
 不触碰 §37 任一底线。
+
+### 39.12 第三轮独立评审整改（R3 / R4 / 文档与工程化）
+
+第三轮独立评审给出 8.8/10，并列出修复建议。本节记录其全部落地：
+
+- **R3（seccomp 跨 ABI 绕过，中危）** —— 原过滤器仅校验原生 `arch`，对其它 arch 一律
+  `ALLOW`，可被 i386/x32（x86_64）或 32 位 ARM（aarch64）ABI 绕过以发起 `TIOCSTI`。
+  整改：见 §39.1「多 ABI 加固」——枚举机器全部 ABI 逐一拦截，外来 arch 一律 `EPERM`
+  拒绝；cBPF 用标签 + 两遍偏移解析生成；新增微型 cBPF 解释器做行为级证明
+  （原生/x32/i386/arm 拦截、其它 ioctl 放行、外来 arch 拒绝）。README 与本设计的
+  「能防 / 残留项」文案同步更新，不再过度承诺。
+- **R4（systemd-run 下 seccomp fd 透传无测试覆盖）** —— 资源限制开启时直接子进程是
+  `systemd-run --user --scope` 而非 `bwrap`。新增 `test_cli_v2.py` 两例：mock
+  `subprocess.run` 捕获 argv 与 `pass_fds`，断言 `--seccomp <fd>` 仍在 bwrap 段、
+  同一 fd 经 `pass_fds` 传入、启动时 fd 已打开且 inheritable、运行返回后被 `os.close`；
+  并覆盖无 systemd-run 的平路径，确保 fd 生命周期一致。
+- **TOCTOU 残留项** —— 路径解析与 `bwrap` 挂载之间存在 symlink 调包窗口，已在 README
+  「残留项」如实记录（单用户主机低风险，勿在启动窗口指向他人可写目录）。
+- **capability / user namespace 说明** —— README 安全模型补充：启动器非 setuid、不需 root，
+  沙箱进程的 capability 仅存在于非特权 user namespace 内、在宿主映射为 nobody；bwrap
+  默认已清理 ambient/bounding 集，故无需显式 `--cap-drop`，真正边界是内核 userns 与
+  bwrap 实现。
+- **工程化打磨** —— 初始化 git 仓库并加首个提交；新增 GitHub Actions CI（3.11–3.13 单测
+  矩阵 + bwrap dry-run 健全性）；`resolve_kimi_with_source` 复用发现路径以去掉重复的
+  `shutil.which("kimi")`（Q1）；`pyproject.toml` 补 classifiers/keywords/urls；
+  `_inner_shell` 注释说明沙箱内 `-lc` 实际不 source 任何 profile。
+
+本轮整改同样不触碰 §37 任一底线：未挂真实 HOME / `~/.kimi-code`，未 `--dev-bind / /`，
+未默认传敏感环境变量，未 `shell=True`，未自动装依赖或复制凭据，仍如实声明非完整安全沙箱。
