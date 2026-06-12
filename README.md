@@ -91,6 +91,28 @@ python -m pip install -U pip
 pip install -e .
 ```
 
+### Use it from any directory (no activation)
+
+The editable install puts a `kimi-sandbox` entry point in the venv whose
+shebang already points at the venv's Python, so symlinking it onto your `PATH`
+lets you call it from anywhere without activating the venv:
+
+```bash
+# Assumes ~/.local/bin is on your PATH (it usually is).
+ln -sf "$(pwd)/.venv/bin/kimi-sandbox" ~/.local/bin/kimi-sandbox
+kimi-sandbox --version        # works from any directory
+```
+
+Alternatively, install it as an isolated tool with
+[pipx](https://pipx.pypa.io/):
+
+```bash
+pipx install -e .             # adds kimi-sandbox to ~/.local/bin automatically
+```
+
+Either way the launcher still uses the host's `bwrap` and `kimi` from `PATH`
+(or whatever you pass via `--bwrap` / `--kimi`).
+
 ## Usage
 
 ```bash
