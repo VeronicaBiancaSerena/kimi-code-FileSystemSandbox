@@ -1,5 +1,7 @@
 # kimi-sandbox
 
+English | [日本語](README.ja.md)
+
 A filesystem sandbox launcher for [Kimi Code](https://github.com/MoonshotAI),
 built on [bubblewrap](https://github.com/containers/bubblewrap). It runs the
 existing `kimi` CLI inside a restricted filesystem view: your project mounted
