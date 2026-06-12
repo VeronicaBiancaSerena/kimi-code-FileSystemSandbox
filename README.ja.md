@@ -402,4 +402,5 @@ systemd リソース制限）は、手動の `workflow_dispatch` トリガーで
 
 ## ライセンス
 
-MIT
+MIT ライセンスで公開されています。ライセンス全文は [`LICENSE`](LICENSE) ファイルを
+参照してください。
