@@ -27,10 +27,9 @@ classifiers = [
 ]
 
 [project.urls]
-# Kimi Sandbox does not yet have its own public repository; these point at the
-# upstream Kimi Code organisation. Replace with the dedicated kimi-sandbox repo
-# URLs once it is published.
-Homepage = "https://github.com/MoonshotAI"
+Homepage = "https://github.com/VeronicaBiancaSerena/kimi-code-FileSystemSandbox"
+Repository = "https://github.com/VeronicaBiancaSerena/kimi-code-FileSystemSandbox"
+Issues = "https://github.com/VeronicaBiancaSerena/kimi-code-FileSystemSandbox/issues"
 "Kimi Code" = "https://github.com/MoonshotAI"
 
 [project.optional-dependencies]

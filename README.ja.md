@@ -32,6 +32,7 @@ seccomp フィルタ、inode 固定のバインドマウント、ネットワー
 - [必要要件](#必要要件)
 - [インストール](#インストール)
 - [使い方](#使い方)
+- [クイック検証](#クイック検証)
 - [ハードニング用フラグ](#ハードニング用フラグ)
 - [マウント固定（mount pinning）](#マウント固定mount-pinning)
 - [設定ファイル](#設定ファイル)
@@ -141,6 +142,32 @@ kimi-sandbox . --exec "pwd && id && touch /workspace/.write-test"
 実行時に渡される fd（seccomp、固定マウント）を stderr に注記します。`--debug` は実際の
 実行を反映したマウント計画（ネットワーク、seccomp、マウント固定、リソース制限、
 `systemd-run` ラッパー）を表示します。
+
+### クイック検証
+
+プロジェクトディレクトリから Kimi を起動します。
+
+```bash
+kimi-sandbox .
+```
+
+次に、サンドボックス内の Kimi にこのコマンドを実行させます。
+
+```bash
+echo "HOME=$HOME"; echo x > /tmp/ks_test; echo y > "$HOME/ks_test"; echo z > /workspace/ks_test; touch /etc/ks_test || echo ETC_BLOCKED
+```
+
+Kimi を終了し、ホスト側で同じプロジェクトディレクトリに戻って、実際のホストファイル
+システムを確認します。
+
+```bash
+[ -e /tmp/ks_test ] && echo "BAD: host /tmp leaked" || echo "OK: host /tmp clean"; [ -e "$HOME/ks_test" ] && echo "BAD: host HOME leaked" || echo "OK: host HOME clean"; [ -e ./ks_test ] && echo "OK: workspace write visible" || echo "BAD: ./ks_test not found"
+```
+
+期待される結果は、Kimi 内では `HOME=/home/sandbox` と表示され、ホストの `/tmp` と
+ホストの `$HOME` は汚れず、プロジェクト内の `./ks_test` だけが存在することです。
+`/workspace` はデフォルトで書き込み可能です。プロジェクトを変更させずにレビューさせたい
+場合は `--read-only` を使ってください。
 
 ### ハードニング用フラグ
 

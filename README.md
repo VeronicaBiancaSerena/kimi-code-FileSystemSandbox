@@ -31,6 +31,7 @@ exactly what it does and does not protect.
 - [Requirements](#requirements)
 - [Install](#install)
 - [Usage](#usage)
+- [Quick verification](#quick-verification)
 - [Hardening flags](#hardening-flags)
 - [Mount pinning](#mount-pinning)
 - [Config file](#config-file)
@@ -142,6 +143,32 @@ kimi-sandbox . --exec "pwd && id && touch /workspace/.write-test"
 readability, and notes on stderr which fds (seccomp, pinned mounts) would be
 passed at run time. `--debug` prints a mount plan that mirrors the real run
 (network, seccomp, pinning, resource limits, and the `systemd-run` wrapper).
+
+### Quick verification
+
+Start Kimi from the project directory:
+
+```bash
+kimi-sandbox .
+```
+
+Then ask Kimi to run this command inside the sandbox:
+
+```bash
+echo "HOME=$HOME"; echo x > /tmp/ks_test; echo y > "$HOME/ks_test"; echo z > /workspace/ks_test; touch /etc/ks_test || echo ETC_BLOCKED
+```
+
+Exit Kimi, return to the same project directory on the host, and check the
+actual host filesystem:
+
+```bash
+[ -e /tmp/ks_test ] && echo "BAD: host /tmp leaked" || echo "OK: host /tmp clean"; [ -e "$HOME/ks_test" ] && echo "BAD: host HOME leaked" || echo "OK: host HOME clean"; [ -e ./ks_test ] && echo "OK: workspace write visible" || echo "BAD: ./ks_test not found"
+```
+
+The expected result is `HOME=/home/sandbox` inside Kimi; host `/tmp` and host
+`$HOME` stay clean; and `./ks_test` exists in the project. `/workspace` is
+writable by default; use `--read-only` when you want Kimi to review without
+modifying the project.
 
 ### Hardening flags
 

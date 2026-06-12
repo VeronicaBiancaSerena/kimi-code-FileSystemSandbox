@@ -5,3 +5,8 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.sqlite3
