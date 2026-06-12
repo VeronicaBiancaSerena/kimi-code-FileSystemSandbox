@@ -121,8 +121,49 @@ def test_extra_rw_mount(tmp_path):
     assert (str(src.resolve()), "/srv/data") in _pairs(cmd, "--bind")
 
 
-# --- non-merged-/usr layout (#13 / design 12.2) --------------------------
+# --- mount pinning via --bind-fd / --ro-bind-fd (opt #3) -----------------
 
+def test_path_fds_pin_workspace_and_kimi(tmp_path):
+    cfg = make_config(tmp_path)
+    path_fds = {str(cfg.project_dir): 11, str(cfg.kimi_path): 12,
+                str(cfg.kimi_code_home): 13}
+    cmd = build_bwrap_command(cfg, path_fds=path_fds)
+    # rw project -> --bind-fd <fd> /workspace ; ro kimi -> --ro-bind-fd ...
+    assert (("11", "/workspace") in _pairs(cmd, "--bind-fd"))
+    assert (("13", "/kimi-code-home") in _pairs(cmd, "--bind-fd"))
+    assert (("12", "/sandbox/bin/kimi") in _pairs(cmd, "--ro-bind-fd"))
+    # No path-based bind remains for the pinned sources.
+    assert (str(cfg.project_dir), "/workspace") not in _pairs(cmd, "--bind")
+    assert (str(cfg.kimi_path), "/sandbox/bin/kimi") not in _pairs(cmd, "--ro-bind")
+
+
+def test_path_fds_read_only_workspace_uses_ro_bind_fd(tmp_path):
+    cfg = make_config(tmp_path, mode=MODE_READ_ONLY)
+    cmd = build_bwrap_command(cfg, path_fds={str(cfg.project_dir): 9})
+    assert ("9", "/workspace") in _pairs(cmd, "--ro-bind-fd")
+    assert ("9", "/workspace") not in _pairs(cmd, "--bind-fd")
+
+
+def test_path_fds_only_pins_known_sources(tmp_path):
+    # A source without an fd falls back to a path bind (e.g. cache here).
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    cfg = make_config(tmp_path, cache_dir=cache.resolve())
+    cmd = build_bwrap_command(cfg, path_fds={str(cfg.project_dir): 5})
+    assert ("5", "/workspace") in _pairs(cmd, "--bind-fd")
+    # cache had no fd -> still a path bind.
+    assert (str(cache.resolve()), "/cache") in _pairs(cmd, "--bind")
+
+
+def test_no_path_fds_uses_path_binds(tmp_path):
+    cfg = make_config(tmp_path)
+    cmd = build_bwrap_command(cfg)
+    assert "--bind-fd" not in cmd
+    assert "--ro-bind-fd" not in cmd
+    assert (str(cfg.project_dir), "/workspace") in _pairs(cmd, "--bind")
+
+
+# --- non-merged-/usr layout (#13 / design 12.2) --------------------------
 def test_non_merged_usr_layout(tmp_path, monkeypatch):
     """On a distro where /bin, /sbin, /lib are REAL dirs (not symlinks into
     /usr), they must be ro-bound directly, not recreated as --symlink."""

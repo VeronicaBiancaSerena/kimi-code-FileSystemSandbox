@@ -250,6 +250,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Mount an extra host path read-write (repeatable). DANGEROUS.",
     )
     parser.add_argument(
+        "--no-pin-mounts",
+        dest="no_pin_mounts",
+        action="store_true",
+        help=(
+            "Do not pin host bind sources via --bind-fd. Pinning is on by "
+            "default and closes a path-swap (TOCTOU) window; disable only for "
+            "bubblewrap older than 0.5 (no --bind-fd)."
+        ),
+    )
+    parser.add_argument(
         "--config",
         default=None,
         metavar="PATH",
@@ -439,6 +449,7 @@ def print_mount_plan(
     seccomp_active: bool,
     limits: ResourceLimits,
     systemd_run: Path | None,
+    pin_mounts: bool = False,
 ) -> None:
     """Print resolved paths and a human-readable mount plan (design 26).
 
@@ -464,6 +475,7 @@ def print_mount_plan(
     _eprint("  /etc      : minimal read-only (DNS/TLS only)")
     _eprint(f"  network   : {'isolated' if config.no_network else 'enabled'}")
     _eprint(f"  seccomp   : {'TIOCSTI filter active' if seccomp_active else 'off'}")
+    _eprint(f"  pin mounts: {'on (--bind-fd)' if pin_mounts else 'off'}")
     if not limits.is_empty():
         parts = []
         if limits.memory_max is not None:
@@ -486,6 +498,7 @@ def print_start_banner(
     *,
     seccomp_active: bool,
     limits: ResourceLimits,
+    pin_mounts: bool = False,
 ) -> None:
     """Print the start banner (design 5.1). Never prints secrets.
 
@@ -512,6 +525,7 @@ def print_start_banner(
     print("  tmp: isolated tmpfs", file=sys.stderr)
     print(f"  network: {'isolated' if config.no_network else 'enabled'}", file=sys.stderr)
     print(f"  seccomp: {'TIOCSTI filter active' if seccomp_active else 'off'}", file=sys.stderr)
+    print(f"  pin mounts: {'on' if pin_mounts else 'off'}", file=sys.stderr)
     if not limits.is_empty():
         parts = []
         if limits.memory_max is not None:
@@ -523,6 +537,50 @@ def print_start_banner(
         print(f"  limits: {', '.join(parts)} (systemd-run)", file=sys.stderr)
     if config.unsafe_kimi_code_home:
         print("  (unsafe-kimi-code-home active; see warning above)", file=sys.stderr)
+
+
+def open_bind_fds(config: SandboxConfig) -> dict[str, int]:
+    """Open ``O_PATH`` fds for every host bind source, for fd-pinned mounts.
+
+    Returns a mapping ``{source_path_str: fd}`` covering the project dir, the
+    profile kimi-code-home, the persistent cache (if any), the kimi binary, and
+    every extra-mount source. Each fd is marked inheritable so it can be passed
+    to ``bwrap`` via ``subprocess.run(pass_fds=...)`` and used with
+    ``--bind-fd`` / ``--ro-bind-fd``. The caller must close the fds after the
+    run. Duplicate source paths share one fd.
+
+    ``O_PATH`` pins the already-resolved, symlink-free inode without needing
+    read permission, so the only residual race is the single ``open()`` walk
+    itself (rather than the whole window until bwrap mounts).
+    """
+    sources: list[str] = [
+        str(config.project_dir),
+        str(config.kimi_code_home),
+        str(config.kimi_path),
+    ]
+    if config.cache_dir is not None:
+        sources.append(str(config.cache_dir))
+    for mount in config.extra_mounts:
+        sources.append(str(mount.source))
+
+    fds: dict[str, int] = {}
+    current = ""
+    try:
+        for src in sources:
+            if src in fds:
+                continue
+            current = src
+            fd = os.open(src, os.O_PATH)
+            os.set_inheritable(fd, True)
+            fds[src] = fd
+    except OSError as exc:
+        for fd in fds.values():
+            os.close(fd)
+        raise SandboxError(
+            f"failed to pin bind source {current!r}: {exc}",
+            "Retry, or pass --no-pin-mounts to disable mount pinning.",
+        ) from exc
+    return fds
 
 
 def _run(command: list[str], *, pass_fds: tuple[int, ...] = ()) -> int:
@@ -699,6 +757,8 @@ def _run_main(args: argparse.Namespace, kimi_args: list[str]) -> int:
         extra_mounts=tuple(extra_mounts),
     )
 
+    pin_mounts = not args.no_pin_mounts
+
     if args.debug:
         print_mount_plan(
             config,
@@ -706,17 +766,24 @@ def _run_main(args: argparse.Namespace, kimi_args: list[str]) -> int:
             seccomp_active=seccomp_active,
             limits=limits,
             systemd_run=systemd_run,
+            pin_mounts=pin_mounts,
         )
 
     if args.dry_run:
-        # Build without a real fd; annotate the seccomp/limits structure so the
-        # printed command faithfully reflects what would run.
+        # Build without real fds; annotate the seccomp/limits/pinning structure
+        # so the printed command faithfully reflects what would run (paths are
+        # shown rather than fd numbers for readability).
         command = build_bwrap_command(config, bwrap_path=bwrap_path)
         if systemd_run is not None:
             command = build_systemd_run_prefix(systemd_run, limits) + command
         print(shlex.join(command))
         if seccomp_active:
             _eprint("note: a TIOCSTI seccomp filter fd would be passed via --seccomp <fd>.")
+        if pin_mounts:
+            _eprint(
+                "note: host bind sources (project, kimi-code-home, cache, kimi "
+                "binary, extra mounts) would be pinned via --bind-fd/--ro-bind-fd."
+            )
         return 0
 
     # --- open the seccomp filter fd (kept open across the run) ---
@@ -728,18 +795,35 @@ def _run_main(args: argparse.Namespace, kimi_args: list[str]) -> int:
             _eprint(f"warning: could not prepare seccomp filter ({exc}); continuing without it.")
             seccomp_active = False
 
+    # --- open O_PATH fds to pin each host bind source (anti-TOCTOU) ---
+    bind_fds: dict[str, int] = {}
     try:
+        if pin_mounts:
+            bind_fds = open_bind_fds(config)
         command = build_bwrap_command(
-            config, bwrap_path=bwrap_path, seccomp_fd=seccomp_fd
+            config,
+            bwrap_path=bwrap_path,
+            seccomp_fd=seccomp_fd,
+            path_fds=bind_fds or None,
         )
         if systemd_run is not None:
             command = build_systemd_run_prefix(systemd_run, limits) + command
-        print_start_banner(config, seccomp_active=seccomp_active, limits=limits)
-        pass_fds = (seccomp_fd,) if seccomp_fd is not None else ()
-        return _run(command, pass_fds=pass_fds)
+        print_start_banner(
+            config,
+            seccomp_active=seccomp_active,
+            limits=limits,
+            pin_mounts=pin_mounts,
+        )
+        fd_list: list[int] = []
+        if seccomp_fd is not None:
+            fd_list.append(seccomp_fd)
+        fd_list.extend(bind_fds.values())
+        return _run(command, pass_fds=tuple(fd_list))
     finally:
         if seccomp_fd is not None:
             os.close(seccomp_fd)
+        for fd in bind_fds.values():
+            os.close(fd)
 
 
 if __name__ == "__main__":

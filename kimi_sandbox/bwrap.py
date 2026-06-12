@@ -80,11 +80,33 @@ def _etc_mount_args() -> list[str]:
     return args
 
 
+def _bind_args(
+    *,
+    source: str,
+    dest: str,
+    writable: bool,
+    path_fds: dict[str, int] | None,
+) -> list[str]:
+    """Emit a single bind, fd-pinned when an fd is available for ``source``.
+
+    If ``path_fds`` carries an fd for ``source`` we use ``--bind-fd`` /
+    ``--ro-bind-fd`` (pinning the resolved inode); otherwise we fall back to the
+    plain path-based ``--bind`` / ``--ro-bind``.
+    """
+    fd = path_fds.get(source) if path_fds else None
+    if fd is not None:
+        flag = "--bind-fd" if writable else "--ro-bind-fd"
+        return [flag, str(fd), dest]
+    flag = "--bind" if writable else "--ro-bind"
+    return [flag, source, dest]
+
+
 def build_bwrap_command(
     config: SandboxConfig,
     *,
     bwrap_path: str | os.PathLike[str] = "bwrap",
     seccomp_fd: int | None = None,
+    path_fds: dict[str, int] | None = None,
 ) -> list[str]:
     """Return the full ``bwrap`` argv for ``config`` (no execution).
 
@@ -92,6 +114,16 @@ def build_bwrap_command(
     ``seccomp_fd`` is given, ``--seccomp <fd>`` is appended; the caller is
     responsible for keeping that fd open and inheritable across the exec
     (``subprocess.run(..., pass_fds=(seccomp_fd,))``).
+
+    When ``path_fds`` is given (mapping a host source path string -> an already
+    open ``O_PATH`` fd), the corresponding bind uses ``--bind-fd`` /
+    ``--ro-bind-fd`` instead of ``--bind`` / ``--ro-bind``. This pins each bind
+    to the exact inode that was resolved and validated, closing the TOCTOU
+    window where the path could be swapped for a symlink between validation and
+    mount. The caller owns those fds (open, ``set_inheritable(True)``, pass via
+    ``pass_fds=``, and close after the run). Sources absent from ``path_fds``
+    fall back to path-based binds (e.g. ``--dry-run``, which prints readable
+    paths rather than fd numbers).
     """
     cmd: list[str] = [os.fspath(bwrap_path)]
 
@@ -142,23 +174,46 @@ def build_bwrap_command(
     # --- project (rw or ro) and kimi profile home (rw) ---
     # read-only mode (§33.2) mounts /workspace with --ro-bind so the project
     # tree cannot be modified; the profile home stays writable for Kimi state.
-    if config.mode == MODE_READ_ONLY:
-        cmd += ["--ro-bind", str(config.project_dir), SANDBOX_WORKSPACE]
-    else:
-        cmd += ["--bind", str(config.project_dir), SANDBOX_WORKSPACE]
-    cmd += ["--bind", str(config.kimi_code_home), SANDBOX_KIMI_CODE_HOME]
+    # Each host source is fd-pinned when ``path_fds`` provides an fd (closing the
+    # validation->mount TOCTOU window); see _bind_args.
+    cmd += _bind_args(
+        source=str(config.project_dir),
+        dest=SANDBOX_WORKSPACE,
+        writable=config.mode != MODE_READ_ONLY,
+        path_fds=path_fds,
+    )
+    cmd += _bind_args(
+        source=str(config.kimi_code_home),
+        dest=SANDBOX_KIMI_CODE_HOME,
+        writable=True,
+        path_fds=path_fds,
+    )
 
     # --- optional persistent cache (design 31.4) ---
     if config.cache_dir is not None:
-        cmd += ["--bind", str(config.cache_dir), SANDBOX_CACHE]
+        cmd += _bind_args(
+            source=str(config.cache_dir),
+            dest=SANDBOX_CACHE,
+            writable=True,
+            path_fds=path_fds,
+        )
 
     # --- extra user mounts (§33.3) ---
     for mount in config.extra_mounts:
-        flag = "--bind" if mount.writable else "--ro-bind"
-        cmd += [flag, str(mount.source), mount.target]
+        cmd += _bind_args(
+            source=str(mount.source),
+            dest=mount.target,
+            writable=mount.writable,
+            path_fds=path_fds,
+        )
 
     # --- kimi binary (read-only single file) ---
-    cmd += ["--ro-bind", str(config.kimi_path), config.sandbox_kimi_target]
+    cmd += _bind_args(
+        source=str(config.kimi_path),
+        dest=config.sandbox_kimi_target,
+        writable=False,
+        path_fds=path_fds,
+    )
 
     # --- environment (clear then explicit allowlist; design 21) ---
     cmd += ["--clearenv"]

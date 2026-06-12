@@ -65,3 +65,38 @@ jobs:
             echo "unexpected whole-/etc bind in dry-run output" >&2
             exit 1
           fi
+
+  smoke:
+    # Full smoke suite against real bubblewrap. Gated on manual dispatch because
+    # it touches external network (the "network enabled" check) and best-effort
+    # user-systemd resource limits, which are environment-dependent. The smoke
+    # script auto-SKIPs the systemd-run resource-limit check when user systemd
+    # is unavailable, so the resource-limit + seccomp combination is exercised
+    # only on runners that actually support it.
+    name: smoke (real bwrap)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+      - name: Install package
+        run: |
+          python -m pip install -U pip
+          pip install -e .
+      - name: Provide a fake kimi on PATH
+        run: |
+          # The smoke script resolves `kimi` from PATH but never executes it
+          # (every check uses --exec or --dry-run), so a stub is sufficient.
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\necho "fake kimi $*"\n' > "$HOME/.local/bin/kimi"
+          chmod +x "$HOME/.local/bin/kimi"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Run smoke suite
+        run: bash tests/smoke/run_smoke.sh

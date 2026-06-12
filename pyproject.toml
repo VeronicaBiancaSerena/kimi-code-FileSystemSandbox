@@ -27,9 +27,11 @@ classifiers = [
 ]
 
 [project.urls]
+# Kimi Sandbox does not yet have its own public repository; these point at the
+# upstream Kimi Code organisation. Replace with the dedicated kimi-sandbox repo
+# URLs once it is published.
 Homepage = "https://github.com/MoonshotAI"
-Documentation = "https://github.com/MoonshotAI"
-Issues = "https://github.com/MoonshotAI"
+"Kimi Code" = "https://github.com/MoonshotAI"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0"]

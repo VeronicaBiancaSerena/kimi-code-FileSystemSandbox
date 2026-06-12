@@ -314,10 +314,9 @@ def test_seccomp_fd_passes_through_systemd_run(tmp_path, monkeypatch):
     def fake_run(command, pass_fds=()):
         captured["command"] = command
         captured["pass_fds"] = pass_fds
-        # The fd must be open and inheritable at the moment of launch.
-        (fd,) = pass_fds
-        captured["fstat_ok"] = os.fstat(fd) is not None
-        captured["inheritable"] = os.get_inheritable(fd)
+        # Every passed fd must be open and inheritable at the moment of launch.
+        captured["fstat_ok"] = all(os.fstat(fd) is not None for fd in pass_fds)
+        captured["inheritable"] = all(os.get_inheritable(fd) for fd in pass_fds)
         return _CP()
 
     monkeypatch.setattr(cli.subprocess, "run", fake_run)
@@ -340,8 +339,9 @@ def test_seccomp_fd_passes_through_systemd_run(tmp_path, monkeypatch):
     # The bwrap portion still carries --seccomp <fd>.
     assert "--seccomp" in cmd
     fd_in_cmd = int(cmd[cmd.index("--seccomp") + 1])
-    # That same fd is passed for inheritance.
-    assert captured["pass_fds"] == (fd_in_cmd,)
+    # That same fd is among those passed for inheritance (alongside the pinned
+    # mount fds), and is open + inheritable at launch time.
+    assert fd_in_cmd in captured["pass_fds"]
     assert captured["fstat_ok"] is True
     assert captured["inheritable"] is True
 
@@ -387,6 +387,115 @@ def test_seccomp_fd_closed_even_without_systemd_run(tmp_path, monkeypatch):
     assert cmd[0] == str(bwrap)
     assert "--seccomp" in cmd
     fd_in_cmd = int(cmd[cmd.index("--seccomp") + 1])
-    assert captured["pass_fds"] == (fd_in_cmd,)
+    assert fd_in_cmd in captured["pass_fds"]
     with pytest.raises(OSError):
         os.fstat(fd_in_cmd)
+
+
+# --- mount pinning (anti-TOCTOU, opt #3): --bind-fd / --ro-bind-fd ---------
+
+def test_pin_mounts_default_uses_bind_fd_and_closes(tmp_path, monkeypatch):
+    """By default each host bind source is pinned via an O_PATH fd and the argv
+    uses --bind-fd/--ro-bind-fd; every pinned fd is passed for inheritance and
+    closed after the run."""
+    import os
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    state = tmp_path / "state"
+    kimi = _make_fake_bin(tmp_path / "kimi", "\x7fELF")
+    bwrap = _make_fake_bin(tmp_path / "bwrap")
+    # Disable seccomp to isolate the mount fds in pass_fds.
+    captured: dict = {}
+
+    class _CP:
+        returncode = 0
+
+    def fake_run(command, pass_fds=()):
+        captured["command"] = command
+        captured["pass_fds"] = pass_fds
+        captured["all_open"] = all(os.fstat(fd) is not None for fd in pass_fds)
+        return _CP()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    rc = cli.main(
+        [str(project), "--kimi", str(kimi), "--bwrap", str(bwrap),
+         "--state-root", str(state), "--no-seccomp"]
+    )
+    assert rc == 0
+    cmd = captured["command"]
+    # Project + kimi-home + kimi binary are fd-pinned.
+    assert "--bind-fd" in cmd       # /workspace and /kimi-code-home (rw)
+    assert "--ro-bind-fd" in cmd    # the kimi binary (ro)
+    # No path-based bind of the project remains.
+    assert ("--bind", str(project.resolve()), "/workspace") not in [
+        (cmd[i], cmd[i + 1], cmd[i + 2])
+        for i in range(len(cmd) - 2)
+    ]
+    # The fd numbers in the argv are exactly those passed for inheritance.
+    fd_args: list[int] = []
+    for i, tok in enumerate(cmd):
+        if tok in ("--bind-fd", "--ro-bind-fd"):
+            fd_args.append(int(cmd[i + 1]))
+    assert set(fd_args) == set(captured["pass_fds"])
+    assert captured["all_open"] is True
+    # All pinned fds are closed after the run returns.
+    for fd in captured["pass_fds"]:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+def test_no_pin_mounts_uses_path_binds(tmp_path, monkeypatch):
+    """--no-pin-mounts falls back to path-based binds and passes no mount fds."""
+    project = tmp_path / "proj"
+    project.mkdir()
+    state = tmp_path / "state"
+    kimi = _make_fake_bin(tmp_path / "kimi", "\x7fELF")
+    bwrap = _make_fake_bin(tmp_path / "bwrap")
+    captured: dict = {}
+
+    class _CP:
+        returncode = 0
+
+    def fake_run(command, pass_fds=()):
+        captured["command"] = command
+        captured["pass_fds"] = pass_fds
+        return _CP()
+
+    monkeypatch.setattr(cli.subprocess, "run", fake_run)
+
+    rc = cli.main(
+        [str(project), "--kimi", str(kimi), "--bwrap", str(bwrap),
+         "--state-root", str(state), "--no-seccomp", "--no-pin-mounts"]
+    )
+    assert rc == 0
+    cmd = captured["command"]
+    assert "--bind-fd" not in cmd
+    assert "--ro-bind-fd" not in cmd
+    assert ("--bind", str(project.resolve()), "/workspace") in [
+        (cmd[i], cmd[i + 1], cmd[i + 2]) for i in range(len(cmd) - 2)
+    ]
+    # No seccomp, no pinning -> no inherited fds at all.
+    assert captured["pass_fds"] == ()
+
+
+def test_dry_run_shows_paths_not_fds(tmp_path, capsys, monkeypatch):
+    """--dry-run prints readable path binds (not fd numbers) and notes pinning."""
+    monkeypatch.setenv("HOME", str(tmp_path / "realhome"))
+    (tmp_path / "realhome").mkdir()
+    project = tmp_path / "proj"
+    project.mkdir()
+    state = tmp_path / "state"
+    kimi = _make_fake_bin(tmp_path / "kimi", "\x7fELF")
+    bwrap = _make_fake_bin(tmp_path / "bwrap")
+
+    rc = cli.main(
+        [str(project), "--kimi", str(kimi), "--bwrap", str(bwrap),
+         "--state-root", str(state), "--dry-run"]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "--bind-fd" not in captured.out      # readable path form in dry-run
+    assert f"--bind {project.resolve()} /workspace" in captured.out
+    assert "pinned via --bind-fd" in captured.err

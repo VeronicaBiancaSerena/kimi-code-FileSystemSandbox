@@ -240,6 +240,25 @@ fi
 rm -f "$PROJECT/rw-override"
 rm -f "$CFG"
 
+# v2.10 mount pinning is on by default and uses --bind-fd at run time
+note "v2.10 mount pinning (--bind-fd)"
+if run --debug --exec "true" 2>&1 1>/dev/null | grep -q "pin mounts: on" \
+   && run --no-pin-mounts --debug --exec "true" 2>&1 1>/dev/null | grep -q "pin mounts: off"; then
+  ok "pin mounts on by default, --no-pin-mounts disables it"
+else
+  bad "pin mounts plan markers"
+fi
+
+# v2.11 pinned run still writes the workspace correctly
+note "v2.11 pinned workspace write"
+if run --exec "echo pinned > /workspace/.pin-test && test -f /workspace/.pin-test" >/dev/null 2>&1 \
+   && test -f "$PROJECT/.pin-test"; then
+  ok "fd-pinned /workspace write visible on host"
+else
+  bad "fd-pinned /workspace write"
+fi
+rm -f "$PROJECT/.pin-test"
+
 printf '\n========================\n'
 printf 'smoke: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
