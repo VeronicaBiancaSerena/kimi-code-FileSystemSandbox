@@ -38,6 +38,8 @@ seccomp フィルタ、inode 固定のバインドマウント、ネットワー
 - [設定ファイル](#設定ファイル)
 - [オプション](#オプション)
 - [サンドボックス内部の様子](#サンドボックス内部の様子)
+- [MCP とスキル](#mcp-とスキル)
+- [Conda サポート](#conda-サポート)
 - [セキュリティモデル](#セキュリティモデル)
 - [推奨する Kimi 設定](#推奨する-kimi-設定)
 - [開発](#開発)
@@ -272,6 +274,8 @@ rw_mounts        = []
 | --- | --- | --- |
 | `/workspace` | あなたのプロジェクト | 読み書き（`--read-only` で読み取り専用） |
 | `/kimi-code-home` | プロファイルの状態ディレクトリ | 読み書き |
+| `/kimi-code-home/skills` | ホストのスキルディレクトリ（`profile_ro_mounts` 経由） | 読み取り専用 |
+| `/home/sandbox/.kimi-code` | シンボリックリンク → `/kimi-code-home`（`compat_kimi_home`） | — |
 | `/cache` | プロファイルのキャッシュディレクトリ | 読み書き（`--persistent-cache` 時のみ） |
 | `/home/sandbox` | tmpfs（`HOME`） | 読み書き、揮発性 |
 | `/tmp`, `/run` | tmpfs | 読み書き、揮発性 |
@@ -302,6 +306,423 @@ HOME=/home/sandbox
 固定 `PATH` が設定されます。認証情報やエージェントソケット（`*_API_KEY`, `AWS_*`,
 `GITHUB_TOKEN`, `SSH_AUTH_SOCK` など）は決して引き継がれません。Kimi の `Bash` から
 `echo $KIMI_SANDBOX` で確認できます。
+
+## MCP とスキル
+
+サンドボックスは、既存の MCP サーバーや Kimi スキルを **プロジェクトに何もコピーせず**
+利用可能にできます。ソース・スクリプト・ランタイムは現在のホスト上の場所から **読み取り
+専用** でバインドマウントされます。サンドボックス内の Kimi・Bash・フック・MCP 子プロセスは
+それらを読み取り・実行できますが、変更はできません。書き込み可能な状態は分離されます。
+プロファイル設定や認証情報は `/kimi-code-home`、キャッシュは `/cache`、一時ファイルは
+`/tmp` です。
+
+すべて既定の設定ファイルで駆動するため、一度セットアップすれば素の `kimi-sandbox .` が
+そのまま動きます。
+
+```bash
+kimi-sandbox init-integrations          # 推奨設定を表示（ドライラン）
+kimi-sandbox init-integrations --write  # ~/.config/kimi-sandbox/config.toml を作成
+kimi-sandbox doctor --config-check      # 設定とマウント計画を検証
+kimi-sandbox .                          # MCP + スキルをマウントして実行
+```
+
+### 設定キー
+
+- `profile_ro_mounts` — `/kimi-code-home` 配下への読み取り専用サブマウント。
+  `HOST:RELATIVE_TARGET` 形式で記述し、スキルディレクトリを `/kimi-code-home/skills`
+  に公開するために使います。ターゲットは `..` を含まない相対パスに限定され、プロファイル
+  ツリーの外には決して出られません。
+- `ro_mounts` — MCP ソースと言語ランタイムを `/opt/...`（例: `/opt/kimi-mcp/...`,
+  `/opt/kimi-runtime/...`）へ読み取り専用でマウントします。
+- `env_keep` — **明示的に** 転送するホスト変数（例: トークン）。既定では機微な変数は
+  一切転送されず、ワイルドカードもありません。
+- `env_set` — 設定ファイルで指定する固定の環境値。
+- `compat_kimi_home` — true（既定）のとき `/home/sandbox/.kimi-code` を
+  `/kimi-code-home` へのシンボリックリンクにします。`~/.kimi-code` を参照するツールでも
+  永続プロファイルに解決されます。`--compat-kimi-home` / `--no-compat-kimi-home` で切替。
+- `conda_enabled` / `conda_root` / `conda_writable` / `conda_shell_integration`
+  / `conda_existing_envs` — 制御された conda 連携（[Conda サポート](#conda-サポート)
+  を参照）。ホストの conda root は読み取り専用でマウントされ、新しい env は
+  `/cache/conda`（または `/tmp/kimi-conda`）に作成されます。
+
+`env_keep` / `env_set` はランチャー予約変数（`HOME`, `PATH`, `KIMI_CODE_HOME`,
+`TMPDIR`, `XDG_*`, `KIMI_SANDBOX*`、および conda 有効時は `CONDARC`,
+`CONDA_ENVS_PATH`, `CONDA_PKGS_DIRS`, `BASH_ENV`, `KIMI_SANDBOX_CONDA_*`）を
+上書き **できません**。試みるとエラーになります。
+キャッシュ位置は `XDG_CACHE_HOME` の上書きではなく `persistent_cache = true` を使います。
+
+### `config.toml` の例
+
+```toml
+profile = "default"
+persistent_cache = true
+compat_kimi_home = true
+
+profile_ro_mounts = [
+  "~/.kimi-code/skills:skills",
+]
+
+ro_mounts = [
+  "~/mcp/github_mcp:/opt/kimi-mcp/github_mcp",
+  "~/miniconda3/envs/github-mcp:/opt/kimi-runtime/github-mcp",
+]
+
+env_keep = [
+  "GITHUB_TOKEN",
+]
+
+[env_set]
+PYTHONDONTWRITEBYTECODE = "1"
+KIMI_SANDBOX_MCP_ROOT = "/opt/kimi-mcp"
+```
+
+### スキルの dotenv ファイル
+
+API キーなどの秘密値を、スキルの `SKILL.md` や Kimi へのプロンプトに直接書かないで
+ください。スキルから呼び出すツールが、ソースツリーやホスト側の設定ディレクトリにある
+dotenv ファイルを読む場合は、そのファイルを読み取り専用でサンドボックスへマウントし、
+`env_set` でツールにサンドボックス内パスを指定します。
+
+たとえば `imagegencli_codex` のようなツールで有効です。サンドボックス内では
+`HOME=/home/sandbox` になるため、ホスト側の `~/.config/imagegencli_codex/.env` のような
+ファイルは、明示的にマウントしない限り見えません。dotenv ファイルを `/opt` 配下へ
+マウントし、ツールの env-file 変数を設定します。
+
+```toml
+ro_mounts = [
+  "~/skills/imagegencli_codex/.env:/opt/imagegencli_codex.env",
+]
+
+[env_set]
+IMAGEGENCLI_CODEX_ENV_FILE = "/opt/imagegencli_codex.env"
+```
+
+マウントは読み取り専用のままにし、ファイル内容をログへ出さないでください。秘密値を
+表示せずに存在確認できます。
+
+```bash
+kimi-sandbox doctor --config-check
+kimi-sandbox . --exec 'test -r /opt/imagegencli_codex.env'
+kimi-sandbox . --exec 'conda run -n imagegencli_codex imagegencli_codex doctor'
+```
+
+### MCP サーバー設定はサンドボックス内パスを使うこと
+
+Kimi の MCP 設定（検証済みのレイアウト: `~/.kimi-code/mcp.json`、スキーマ
+`{"mcpServers": {<name>: {...}}}`）は、ホストパスではなく **サンドボックス内** パスを
+参照する必要があります（同じ場所にマウントされている場合を除く）。
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "/opt/kimi-runtime/github-mcp/bin/python",
+      "args": ["/opt/kimi-mcp/github_mcp/server.py"],
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "MCP_CACHE_DIR": "/cache/github-mcp"
+      }
+    }
+  }
+}
+```
+
+ランチャーはこのファイルを **自動生成しません**。お使いの Kimi の MCP 設定形式を確認の
+うえ、サンドボックスプロファイル内の `mcp.json` を手で編集してください
+（`~/.local/state/kimi-sandbox/profiles/<profile>/kimi-code-home/mcp.json`）。
+`doctor` はレイアウトを認識できたかを報告しますが、認識できなくてもランチャーの失敗とは
+みなしません。
+
+### 書き込みの約束（読み取り専用マウントを守るため）
+
+- MCP ソース（`/opt/kimi-mcp/...`）とランタイム（`/opt/kimi-runtime/...`）へは
+  書き込まないこと: ログ・キャッシュ・データベース・`.pyc` のいずれも不可。
+- `PYTHONDONTWRITEBYTECODE=1` を設定し、Python が読み取り専用ソースへ `__pycache__` を
+  書き込むのを防ぎます。
+- ランタイムのキャッシュは `/cache/<server>`（または `/tmp`）へリダイレクトし、ランタイム
+  マウントには書き込みません。各サーバーが必要とするものだけを選びます:
+
+```toml
+persistent_cache = true
+
+[env_set]
+PYTHONDONTWRITEBYTECODE = "1"
+PIP_CACHE_DIR = "/cache/pip"
+UV_CACHE_DIR = "/cache/uv"
+NPM_CONFIG_CACHE = "/cache/npm"
+HF_HOME = "/cache/huggingface"
+TORCH_HOME = "/cache/torch"
+```
+
+- サーバー単位の永続キャッシュ → `/cache/<server>`。プロファイル単位の状態 →
+  `/kimi-code-home/mcp-state/<server>`。一時ファイル → `/tmp`。
+
+`/cache/<server>` は再生成して構わないデータに、`/kimi-code-home/mcp-state/<server>`
+は実行をまたいで残し、プロファイルと一緒に移動すべき状態（小さな DB、インデックス、
+登録ファイル）に使います。どちらも書き込み可能なマウント上にあるため、読み取り専用の
+MCP ソースは無傷のままです。各サーバーの MCP `env` ブロックから指定します:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "/opt/kimi-runtime/github-mcp/bin/python",
+      "args": ["/opt/kimi-mcp/github_mcp/server.py"],
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "MCP_CACHE_DIR": "/cache/github-mcp",
+        "MCP_STATE_DIR": "/kimi-code-home/mcp-state/github-mcp"
+      }
+    }
+  }
+}
+```
+
+`/cache` は `persistent_cache = true` のときのみ存在します。`mcp-state` は常に書き込み
+可能なプロファイルホーム配下にあるため追加フラグは不要です。サブディレクトリはサーバー
+自身が作成してください（例: `os.makedirs(..., exist_ok=True)`）。ランチャーはサーバー
+単位のキャッシュ／状態ディレクトリを事前作成しません。
+
+### 検証
+
+```bash
+# スキルディレクトリはサンドボックス内で読めるが書けない:
+kimi-sandbox . --exec \
+  'test -r /kimi-code-home/skills && ! touch /kimi-code-home/skills/.w'
+
+# 最小の MCP ソースが動作し、読み取り専用のまま /cache にキャッシュを書く:
+kimi-sandbox . --exec \
+  'python3 /opt/kimi-mcp/fake/fake_server.py && ! touch /opt/kimi-mcp/fake/.w'
+```
+
+実際の `~/.kimi-code` を書き込み可能でサンドボックスにマウントしないでください。
+スキルディレクトリだけを `profile_ro_mounts` で公開します。
+
+### `doctor` と `init-integrations` の注意
+
+- `doctor --config-check` は設定とドライランのマウント計画を検証します。助言的な事項は
+  `WARN`（失敗ではない）として扱います: 認識できない Kimi レイアウト、空の `skills/`
+  マウントポイント、キャッシュリダイレクトのないランタイムマウント、どのマウントターゲット
+  にも含まれない MCP コマンドパス、そして `rw_mounts`（統合モデルは読み取り専用のため
+  書き込み可能マウントは指摘されます）。重大な問題（解析不能な設定、欠落／不正なマウント
+  ソース）は非ゼロ終了で失敗します。スキルソースの助言的シンボリックリンク走査は既定で
+  上限付きです。非常に大きなスキルツリーを網羅的に走査するには `doctor --deep` を使います。
+- `init-integrations` は既定でドライランです。`--write` は欠落している設定を作成するか、
+  **完全に存在しない** トップレベルキーのみを（タイムスタンプ付きバックアップの後で）
+  追記します。`profile_ro_mounts` のようなリストキーが既に存在し、推奨項目が欠けている
+  場合は配列を編集せず、手で追加すべき項目を表示します。コメントを保持したままの配列の
+  インプレースマージは v2 に持ち越します。
+
+### 実例: 既存の MCP サーバー + スキルをサンドボックスへ取り込む
+
+サンドボックスは **独自の** プロファイルホームで Kimi を実行するため、MCP サーバーと
+スキルは *サンドボックス内パス* で記述する必要があります。以下は実際の複数サーバー構成を
+配線した手順そのものです。`~/...` と例の名前はご自身のものに置き換えてください。
+
+**1. ランチャーを venv 有効化不要で導入**（[インストール](#インストール) 参照）。任意の
+ディレクトリから `kimi-sandbox --version` が動くことを確認します:
+
+```bash
+ln -s "$(pwd)/.venv/bin/kimi-sandbox" ~/.local/bin/kimi-sandbox   # または pipx を使用
+kimi-sandbox --version
+```
+
+**2. ホストの Kimi が使うものを棚卸し。** `~/.kimi-code/mcp.json`（サーバーのコマンドと
+パスを含む `env`）と `~/.kimi-code/skills/`（通常は実スキルディレクトリへのシンボリック
+リンク）を確認します。各サーバーの **インタプリタ** と **ソース** を把握してください。
+これが再配置（relocation）方法を決めます（後述のチートシート参照）。
+
+**3. `~/.config/kimi-sandbox/config.toml` を書く。** サーバーが必要とするホストパスを
+すべて `/opt` 配下に読み取り専用でマウントし、conda 環境を使うサーバーがあれば conda を
+有効化し、スキルを `/kimi-code-home/skills` 配下に公開します:
+
+```toml
+profile = "default"
+persistent_cache = true
+compat_kimi_home = true
+
+# conda 環境から動く MCP サーバーがある場合に有効化。ホストの conda root を実パスで
+# 読み取り専用にバインドするので、「conda 環境のインタプリタ」コマンドが解決できます。
+conda_enabled = true
+conda_root = "~/anaconda3"
+conda_writable = "cache"
+conda_shell_integration = true
+
+ro_mounts = [
+  # MCP ソースツリー（各サーバーの venv + コードを含む）
+  "~/mcp/servers:/opt/kimi-mcp/servers",
+  # editable パッケージの実ソース（チートシート「editable install」）
+  "~/projects/math-mcp/src:/opt/kimi-mcp/math-mcp-src",
+  # venv が指す非システムインタプリタ（チートシート「uv / pyenv」）
+  "~/.local/share/uv/python:/opt/kimi-mcp/uv-python",
+]
+
+# スキルを /kimi-code-home/skills/<name> に読み取り専用で公開。~/.kimi-code/skills の
+# シンボリックリンクではなく、実スキルディレクトリを指してください。
+profile_ro_mounts = [
+  "~/skills/bizplan-writer:skills/bizplan-writer",
+  "~/skills/canvas:skills/canvas",
+]
+
+[env_set]
+PYTHONDONTWRITEBYTECODE = "1"   # 読み取り専用 /opt へ __pycache__ を書かない
+```
+
+> サンドボックスプロファイルの `skills/` に以前の設定で作られた古いシンボリックリンクが
+> 残っている場合は先に削除してください（`find ~/.local/state/kimi-sandbox/profiles/\
+> default/kimi-code-home/skills -maxdepth 1 -type l -delete`）。ランチャーは実ディレクトリ
+> のマウントポイントを作る必要があり、`doctor` はシンボリックリンクのマウントポイントを
+> 失敗として報告します。
+
+**4. サンドボックス用 `mcp.json` を生成。** これは実際の `~/.kimi-code` ではなく
+サンドボックス **プロファイルホーム** に置き、サンドボックス内パスを使います。最も簡単な
+方法はホストのファイルを変換することです。ホストの接頭辞を `/opt` ターゲットへ書き換え、
+editable インストールには `PYTHONPATH` を追加し、秘密の env 値はそのまま保持します:
+
+```python
+# write_sandbox_mcp.py  （任意の python3 で実行。秘密値は一切出力しない）
+import json, os
+HOST = os.path.expanduser("~/.kimi-code/mcp.json")
+SBX  = os.path.expanduser(
+    "~/.local/state/kimi-sandbox/profiles/default/kimi-code-home/mcp.json")
+os.makedirs(os.path.dirname(SBX), mode=0o700, exist_ok=True)
+
+# ホストパス接頭辞 -> サンドボックス内 ro_mounts ターゲット
+REWRITE = {os.path.expanduser("~/mcp/servers"): "/opt/kimi-mcp/servers"}
+# `pip install -e .` のサーバーはソースを PYTHONPATH に載せる必要があります
+# （venv 内の .pth はサンドボックスに存在しないホストパスをハードコードしているため）
+PYTHONPATH = {"math": "/opt/kimi-mcp/math-mcp-src"}
+
+def rw(s):
+    if isinstance(s, str):
+        for h, o in REWRITE.items():
+            s = s.replace(h, o)
+    return s
+
+cfg = json.load(open(HOST))
+out = {"mcpServers": {}}
+for name, spec in cfg["mcpServers"].items():
+    spec = dict(spec)
+    spec["command"] = rw(spec.get("command"))
+    spec["args"] = [rw(a) for a in spec.get("args", [])]
+    env = {k: rw(v) for k, v in (spec.get("env") or {}).items()}  # 秘密値は保持
+    if name in PYTHONPATH:
+        env["PYTHONPATH"] = PYTHONPATH[name]
+    if env:
+        spec["env"] = env
+    out["mcpServers"][name] = spec
+
+json.dump(out, open(SBX, "w"), indent=2)
+os.chmod(SBX, 0o600)
+```
+
+**5. 検証し、サンドボックス内で各サーバーをプローブ。**
+
+```bash
+kimi-sandbox doctor          # 期待値: 0 failed, 0 warning(s)
+
+# 各サーバーのインタプリタ + 依存がサンドボックス内で import できることを確認。例:
+mkdir -p /tmp/probe
+kimi-sandbox /tmp/probe --exec \
+  'PYTHONPATH=/opt/kimi-mcp/math-mcp-src \
+   conda run -n math python -c "import math_mcp; print(\"ok\")"'
+kimi-sandbox /tmp/probe --exec 'ls /kimi-code-home/skills'   # スキルの存在確認
+```
+
+**6. 実行。** これで `kimi-sandbox .` はサーバーとスキルを伴って Kimi を起動します。
+サンドボックスプロファイルは実際の `~/.kimi-code` とは別なので、サンドボックス内で一度
+ログインしてください。そのログインはプロファイルごとの状態ディレクトリに永続します。
+
+#### インタプリタ再配置チートシート
+
+「ホストでは動くのにサンドボックスで動かない」の唯一の原因は、マウントされていないパスが
+venv／インタプリタに焼き込まれていることです。サーバーを次の行に当てはめてください:
+
+| サーバーのインタプリタ／インストール形態 | サンドボックスで必要なこと |
+|---|---|
+| **システム** `python3`（`/usr/bin/python3`）の venv | ソースツリーを `/opt` にマウントするだけ。システム python は既に読み取り専用でマウント済みなので venv はその `/opt` パスからそのまま動く。 |
+| **uv / pyenv** python の venv | そのインタプリタ（例: `~/.local/share/uv/python`）も併せてマウントし、**直接** 実行（`<interp> -m <module>`）。`PYTHONPATH` に venv の `site-packages` ＋ ソースを設定。venv 自身の `python` シンボリックリンクは未マウントのホストパスを指すため。 |
+| **conda 環境** のインタプリタ | `conda_enabled = true` を設定。conda root が実パスにバインドされ、`<conda>/envs/<env>/bin/python`（または `conda run -n <env>`）が解決する。新規 env は `/cache/conda` へ。 |
+| **editable** インストール（`pip install -e`） | 実ソースをマウントし、そのサーバーの `PYTHONPATH` に追加。site-packages の `.pth` はサンドボックスに存在しないホストパスをハードコードしているため。 |
+| ホストパスを含む command／args／env | サンドボックスの `mcp.json` で `/opt` マウントターゲットへ書き換える。 |
+
+`doctor` は各マウントソースの存在、認識された Kimi レイアウトがサンドボックス
+（`/opt/...`）パスを使っていること、そして（conda 有効時は）conda 構成が妥当なことを、
+Kimi の TUI を起動せずに確認します。実際の `~/.kimi-code` が書き込み可能でマウントされる
+ことはありません。
+
+## Conda サポート
+
+既存の conda をサンドボックスへ公開しつつ、ホストの既存 conda 環境はすべて
+読み取り専用に保てます。設定で有効化します:
+
+```toml
+persistent_cache = true
+conda_enabled = true
+conda_root = "~/anaconda3"
+conda_writable = "cache"          # 新しい env/pkg は /cache/conda へ。"tmp" は揮発
+conda_shell_integration = true    # bash -lc での `conda activate` を有効化
+
+# conda_root/envs の外にある追加の既存 env（任意・読み取り専用）:
+# conda_existing_envs = ["~/somewhere/envs/foo:foo"]
+```
+
+サンドボックス内では `conda` が直接使えます:
+
+```bash
+conda --version
+conda env list
+conda run -n math-mcp python -m math_mcp
+conda activate math-mcp && python ...        # conda_shell_integration = true が必要
+conda create -n sandbox-dev python=3.11      # -> /cache/conda/envs/sandbox-dev
+```
+
+推奨する MCP サーバの書き方:
+
+```json
+{ "command": "conda", "args": ["run", "-n", "math-mcp", "python", "-m", "math_mcp"] }
+```
+
+```json
+{ "command": "bash", "args": ["-lc", "conda activate math-mcp && python -m math_mcp"] }
+```
+
+### 読み取り専用と書き込み可能の区別
+
+| 対象 | モード |
+|---|---|
+| ホストの conda root と既存 env／パッケージ | 読み取り専用（`/opt/kimi-conda/root` ＋ 元の絶対パス） |
+| 新しい env／ダウンロードしたパッケージ | 書き込み可能（`/cache/conda` または `/tmp/kimi-conda`） |
+| `conda` の入口 | ランチャ生成 shim（`/sandbox/bin/conda`） |
+
+したがって設計上、次は**失敗**します（ホスト env は読み取り専用）:
+
+```bash
+conda install -n existing-env some-package   # shim が拒否。FS も読み取り専用
+conda env remove -n existing-env             # 拒否
+rm -rf /opt/kimi-conda/root/envs/existing    # 読み取り専用ファイルシステム
+```
+
+shim は conda の引数全体（`--json`、`--name=`、`--prefix`、
+`env update -f environment.yml`、および `--pre` のような曖昧でない省略形を含む）を
+解析し、`/cache/conda/envs/<name>` を確実に対象としない変更操作はすべて拒否します。
+`conda config` は読み取り専用クエリのみ、`conda clean` は書き込み可能なパッケージ
+キャッシュに限定（`--force-pkgs-dirs` は拒否）されます。ホストの conda root は元の
+絶対パスにも読み取り専用でバインドされるため、コンソールスクリプトの
+shebang（`#!/home/you/anaconda3/...`）も解決できます。設定全体は
+`kimi-sandbox doctor` で検証できます。
+
+> **shim はセキュリティ境界ではなく利便性のための層です。** ホストの conda
+> 内容は読み取り専用バインドマウントと、ランチャが強制する
+> `CONDA_ENVS_PATH`／`CONDA_PKGS_DIRS` によって保護されます。これは shim を
+> 迂回しても（実体の conda バイナリを直接呼ぶ、あるいは `conda activate` 後に
+> `CONDA_EXE` が実体へ再設定された後でも）有効です。したがってホスト env への
+> `conda install` は、shim による早期拒否か FS 層のいずれかで必ず**失敗**し、
+> ホストの内容を変更することはありません。
+
+> `conda_writable = "tmp"` で作成した env はサンドボックス実行をまたいで永続
+> **しません**。`no_network = true` の場合、`conda create/install` は利用可能な
+> ローカルチャネル／キャッシュのみ使用できます。
 
 ## セキュリティモデル
 
@@ -370,6 +791,15 @@ HOME=/home/sandbox
   拒否する、ということも考えられますが、現状では未実装です。
 - サンドボックス内の `/dev/shm` は、bubblewrap のデフォルトデバイスセット由来の書き込み
   可能（ただし名前空間ごとに揮発性）な tmpfs です。ホストには影響しません。
+- **conda の変更ポリシーは境界ではありません。** conda を有効化すると、生成された
+  `/sandbox/bin/conda` shim はホスト env への変更を**早期**に明確なメッセージで拒否
+  しますが、これは利便性／早期拒否の層にすぎません。実体の conda バイナリは
+  サンドボックス内から直接到達可能（例: `/opt/kimi-conda/root/bin/conda`）なので、
+  ホストの env／パッケージが変更されない保証は、**読み取り専用バインドマウント**と
+  ランチャが強制する `CONDA_ENVS_PATH`／`CONDA_PKGS_DIRS`／`CONDARC`（すべての書き込みを
+  サンドボックスの書き込み可能領域へ誘導）に由来します。これらは shim を完全に迂回
+  しても（実体の conda 直接呼び出し、または `conda activate` が `CONDA_EXE` を実体へ
+  再設定した後でも）有効です。隔離のために shim の引数解析に依存しないでください。
 - **特権とケイパビリティ。** ランチャーは非特権で動作し、bubblewrap の非特権ユーザー
   名前空間に依存します。サンドボックス内プロセスが保持するケイパビリティはその
   ユーザー名前空間の内側にのみ存在し、ホスト上では *nobody* にマップされるため、ホストの

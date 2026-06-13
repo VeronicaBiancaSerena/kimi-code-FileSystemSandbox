@@ -259,6 +259,125 @@ else
 fi
 rm -f "$PROJECT/.pin-test"
 
+# =====================================================================
+# mod_v1: MCP + Skills read-only integration
+# =====================================================================
+
+# mv1.1 profile_ro_mounts: skill dir readable, not writable; symlink + shadow
+note "mv1.1 profile_ro_mounts skill dir (ro) + compat symlink"
+SKILLS="$(mktemp -d /tmp/ks-skills-XXXXXX)"
+echo "skill-marker" > "$SKILLS/marker"
+CFG1="$(mktemp /tmp/ks-cfg1-XXXXXX.toml)"
+printf 'profile_ro_mounts = ["%s:skills"]\ncompat_kimi_home = true\n' "$SKILLS" > "$CFG1"
+if run --config "$CFG1" --exec \
+     'test -r /kimi-code-home/skills/marker && ! touch /kimi-code-home/skills/write-test' \
+     >/dev/null 2>&1; then
+  ok "skill dir readable inside, not writable"
+else
+  bad "skill dir read/ro check"
+fi
+# Host skills dir must be unmodified (no write-test leaked through).
+if test ! -e "$SKILLS/write-test"; then
+  ok "host skill dir not modified"
+else
+  bad "host skill dir was modified"
+fi
+# compat symlink ~/.kimi-code -> /kimi-code-home
+if run --config "$CFG1" --exec \
+     'test -L /home/sandbox/.kimi-code && test "$(readlink /home/sandbox/.kimi-code)" = /kimi-code-home' \
+     >/dev/null 2>&1; then
+  ok "/home/sandbox/.kimi-code symlinks to /kimi-code-home"
+else
+  bad "compat kimi-home symlink"
+fi
+# --no-compat-kimi-home disables the symlink.
+if run --config "$CFG1" --no-compat-kimi-home --exec 'test ! -L /home/sandbox/.kimi-code' \
+     >/dev/null 2>&1; then
+  ok "--no-compat-kimi-home disables the symlink"
+else
+  bad "--no-compat-kimi-home still created the symlink"
+fi
+rm -rf "$SKILLS"; rm -f "$CFG1"
+
+# mv1.2 fake MCP source: executable + read-only; cache writes to /cache/<server>
+note "mv1.2 fake MCP source (ro) + cache to /cache"
+MCPDIR="$(mktemp -d /tmp/ks-mcp-XXXXXX)"
+cat > "$MCPDIR/fake_server.py" <<'PY'
+import os
+cache = os.environ.get("MCP_CACHE_DIR", "/tmp/fallback")
+os.makedirs(cache, exist_ok=True)
+open(os.path.join(cache, "marker"), "w").write("ok")
+print('{"status": "ok"}')
+PY
+CFG2="$(mktemp /tmp/ks-cfg2-XXXXXX.toml)"
+cat > "$CFG2" <<EOF
+persistent_cache = true
+ro_mounts = ["$MCPDIR:/opt/kimi-mcp/fake"]
+
+[env_set]
+PYTHONDONTWRITEBYTECODE = "1"
+MCP_CACHE_DIR = "/cache/fake"
+EOF
+if run --config "$CFG2" --exec \
+     'python3 /opt/kimi-mcp/fake/fake_server.py >/dev/null && ! touch /opt/kimi-mcp/fake/write-test && test -f /cache/fake/marker' \
+     >/dev/null 2>&1; then
+  ok "fake MCP runs, source not writable, cache marker in /cache/fake"
+else
+  bad "fake MCP source ro / cache write"
+fi
+# Host MCP source must have no write-test and no __pycache__ (PYTHONDONTWRITEBYTECODE).
+if test ! -e "$MCPDIR/write-test" && test ! -d "$MCPDIR/__pycache__"; then
+  ok "host MCP source unmodified (no write-test, no __pycache__)"
+else
+  bad "host MCP source was modified"
+fi
+# Cache persisted to the host profile cache dir, not the source.
+if test -f "$STATE_ROOT/profiles/default/cache/fake/marker"; then
+  ok "MCP cache persisted under host profile cache"
+else
+  bad "MCP cache not found in host profile cache"
+fi
+rm -rf "$MCPDIR"; rm -f "$CFG2"
+
+# mv1.3 env_keep forwards a declared secret; reserved-key override is rejected
+note "mv1.3 env_keep / reserved-key protection"
+CFG3="$(mktemp /tmp/ks-cfg3-XXXXXX.toml)"
+printf 'env_keep = ["SMOKE_TOKEN"]\n' > "$CFG3"
+if SMOKE_TOKEN=smoke-secret run --config "$CFG3" --exec 'test "$SMOKE_TOKEN" = smoke-secret' >/dev/null 2>&1; then
+  ok "env_keep forwards a declared host variable"
+else
+  bad "env_keep passthrough"
+fi
+# A var NOT in env_keep must not leak in.
+if SMOKE_OTHER=nope run --config "$CFG3" --exec 'test -z "$SMOKE_OTHER"' >/dev/null 2>&1; then
+  ok "undeclared host variable not forwarded"
+else
+  bad "undeclared variable leaked into sandbox"
+fi
+# Reserved-key override via [env_set] must be rejected (launcher error 125).
+CFG4="$(mktemp /tmp/ks-cfg4-XXXXXX.toml)"
+printf '[env_set]\nPATH = "/evil"\n' > "$CFG4"
+run --config "$CFG4" --dry-run >/dev/null 2>&1
+if [ "$?" -eq 125 ]; then
+  ok "env_set override of reserved PATH rejected (error 125)"
+else
+  bad "reserved env override not rejected"
+fi
+rm -f "$CFG3" "$CFG4"
+
+# mv1.4 doctor --config-check validates a good config
+note "mv1.4 doctor --config-check"
+SKILLS2="$(mktemp -d /tmp/ks-skills2-XXXXXX)"
+echo m > "$SKILLS2/marker"
+CFG5="$(mktemp /tmp/ks-cfg5-XXXXXX.toml)"
+printf 'profile_ro_mounts = ["%s:skills"]\n' "$SKILLS2" > "$CFG5"
+if "$KS" doctor --config-check --config "$CFG5" --state-root "$STATE_ROOT" 2>&1 | grep -q "0 failed"; then
+  ok "doctor reports a clean config-check"
+else
+  bad "doctor config-check"
+fi
+rm -rf "$SKILLS2"; rm -f "$CFG5"
+
 printf '\n========================\n'
 printf 'smoke: %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

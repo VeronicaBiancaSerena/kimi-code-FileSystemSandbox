@@ -31,6 +31,25 @@ class ExtraMount:
 
 
 @dataclass(frozen=True)
+class ProfileMount:
+    """Read-only host mount below ``/kimi-code-home`` (mod_v1 §6).
+
+    ``source`` is a resolved host path (v1: must be an existing directory).
+    ``relative_target`` is a normalized, ``..``-free relative path such as
+    ``"skills"`` or ``"integrations/skills"``. The final in-sandbox target is
+    always ``/kimi-code-home/<relative_target>``.
+
+    A dedicated type (rather than reusing :class:`ExtraMount`) is what keeps
+    these mounts strictly confined to the profile tree: ``ExtraMount.target`` is
+    an arbitrary absolute sandbox path, whereas a profile sub-mount must never
+    escape ``/kimi-code-home``. That confinement is a security boundary.
+    """
+
+    source: Path
+    relative_target: str
+
+
+@dataclass(frozen=True)
 class ResourceLimits:
     """Optional cgroup resource limits applied via ``systemd-run --user``.
 
@@ -49,6 +68,60 @@ class ResourceLimits:
             and self.cpu_quota is None
             and self.pids_max is None
         )
+
+
+@dataclass(frozen=True)
+class CondaExistingEnv:
+    """An extra, already-existing host conda env, mounted read-only (mod_v2 §10).
+
+    ``source`` is a resolved host env directory; ``name`` is the in-sandbox env
+    name it is exposed under at ``/opt/kimi-conda/existing-envs/<name>``. Unlike
+    a generic mount these are always read-only — the v2 contract is that
+    pre-existing host conda content can never be modified inside the sandbox.
+    """
+
+    source: Path
+    name: str
+
+
+@dataclass(frozen=True)
+class CondaConfig:
+    """Fully resolved controlled-conda integration (mod_v2 §10).
+
+    ``root`` is the resolved host conda root (must contain ``bin/conda``). It is
+    bound read-only at two in-sandbox paths: the canonical ``sandbox_root``
+    (``/opt/kimi-conda/root``) and ``sandbox_original_root`` — the conda root's
+    original absolute host path, recreated inside the sandbox so hard-coded
+    console-script shebangs (``#!/home/user/anaconda3/bin/python``) still
+    resolve (mod_v2 §7.6).
+
+    ``writable_root`` is the in-sandbox writable area for *new* envs/packages
+    (``/cache/conda`` or ``/tmp/kimi-conda``); host conda content is never
+    written. ``shell_integration`` toggles the ``conda activate`` bash hook
+    (``BASH_ENV``). ``existing_envs`` are extra read-only host envs.
+    """
+
+    root: Path
+    sandbox_original_root: str
+    writable_root: str
+    shell_integration: bool
+    existing_envs: tuple[CondaExistingEnv, ...] = ()
+    sandbox_root: str = "/opt/kimi-conda/root"
+
+
+@dataclass(frozen=True)
+class GeneratedFileMount:
+    """A launcher-generated file bound read-only into the sandbox (mod_v2 §10).
+
+    ``source`` is a host path the launcher wrote (e.g. the conda shim); ``target``
+    is the absolute in-sandbox path it is bound at. ``executable`` records that
+    the source needs +x (the conda shim) so the launcher can chmod it. Generic
+    so future launcher helpers can reuse it, not just conda.
+    """
+
+    source: Path
+    target: str
+    executable: bool = False
 
 
 @dataclass(frozen=True)
@@ -77,8 +150,16 @@ class SandboxConfig:
     cache_dir: Path | None = None
     # Extra host mounts (v2 §33.3).
     extra_mounts: tuple[ExtraMount, ...] = ()
+    # Read-only profile sub-mounts under /kimi-code-home (mod_v1 §6/§10).
+    profile_ro_mounts: tuple[ProfileMount, ...] = ()
+    # Lay down /home/sandbox/.kimi-code -> /kimi-code-home symlink (mod_v1 §10.3).
+    compat_kimi_home: bool = True
     # Sandbox-internal mount target for the kimi binary.
     sandbox_kimi_target: str = "/sandbox/bin/kimi"
+    # Controlled conda integration (mod_v2); None when conda is disabled.
+    conda: CondaConfig | None = None
+    # Launcher-generated files bound read-only (conda shim/condarc/bash hook).
+    generated_file_mounts: tuple[GeneratedFileMount, ...] = ()
 
 
 # Sandbox-internal canonical paths (see design section 11).
@@ -88,6 +169,24 @@ SANDBOX_HOME = "/home/sandbox"
 SANDBOX_KIMI_BIN_DIR = "/sandbox/bin"
 SANDBOX_KIMI_BIN = "/sandbox/bin/kimi"
 SANDBOX_CACHE = "/cache"
+
+# Controlled-conda sandbox-internal paths (mod_v2 §4.1).
+SANDBOX_ETC_DIR = "/sandbox/etc"
+SANDBOX_CONDA_ROOT = "/opt/kimi-conda/root"
+SANDBOX_CONDA_EXISTING_ENVS = "/opt/kimi-conda/existing-envs"
+SANDBOX_CONDA_SHIM = "/sandbox/bin/conda"
+SANDBOX_CONDARC = "/sandbox/etc/condarc"
+SANDBOX_CONDA_BASH_ENV = "/sandbox/etc/conda-bash-env"
+SANDBOX_CONDA_CACHE_WRITABLE = "/cache/conda"
+SANDBOX_CONDA_TMP_WRITABLE = "/tmp/kimi-conda"
+
+# A host conda root / existing env is bound read-only twice: once at its
+# canonical /opt/kimi-conda path and once at its original absolute path (for
+# shebang compatibility). bubblewrap closes each bind fd after use, so the
+# second (alias) bind needs its *own* pinned fd. ``path_fds`` therefore carries
+# the alias fd under ``<source><CONDA_ALIAS_FD_SUFFIX>`` — a key that cannot
+# collide with any real host path (NUL is not allowed in pathnames).
+CONDA_ALIAS_FD_SUFFIX = "\x00alias"
 
 # Minimal /etc allowlist for DNS, hosts, NSS and TLS trust (design 12.3 / 28.11).
 #
@@ -115,7 +214,11 @@ ETC_MIN_DIRS = (
 __all__ = [
     "SandboxConfig",
     "ExtraMount",
+    "ProfileMount",
     "ResourceLimits",
+    "CondaConfig",
+    "CondaExistingEnv",
+    "GeneratedFileMount",
     "MODE_WORKSPACE_WRITE",
     "MODE_READ_ONLY",
     "SANDBOX_WORKSPACE",
@@ -124,6 +227,15 @@ __all__ = [
     "SANDBOX_KIMI_BIN_DIR",
     "SANDBOX_KIMI_BIN",
     "SANDBOX_CACHE",
+    "SANDBOX_ETC_DIR",
+    "SANDBOX_CONDA_ROOT",
+    "SANDBOX_CONDA_EXISTING_ENVS",
+    "SANDBOX_CONDA_SHIM",
+    "SANDBOX_CONDARC",
+    "SANDBOX_CONDA_BASH_ENV",
+    "SANDBOX_CONDA_CACHE_WRITABLE",
+    "SANDBOX_CONDA_TMP_WRITABLE",
+    "CONDA_ALIAS_FD_SUFFIX",
     "ETC_MIN_FILES",
     "ETC_MIN_DIRS",
 ]

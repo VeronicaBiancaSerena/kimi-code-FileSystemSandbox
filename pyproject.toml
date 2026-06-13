@@ -43,3 +43,20 @@ include = ["kimi_sandbox*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+# Launcher code targets the minimum supported runtime.
+target-version = "py311"
+line-length = 100
+extend-exclude = [".venv"]
+
+[tool.ruff.lint]
+# A focused, low-noise rule set: pyflakes (F), pycodestyle (E/W), isort (I),
+# pyupgrade (UP), flake8-bugbear (B). This catches unused imports/names, import
+# ordering, and common bugs without imposing stylistic churn.
+select = ["E", "W", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests favour terse, compact fixtures (multiple statements per line, long
+# data lines); do not let stylistic rules add noise there.
+"tests/**" = ["E701", "E702", "E501"]

@@ -37,6 +37,8 @@ exactly what it does and does not protect.
 - [Config file](#config-file)
 - [Options](#options)
 - [Inside the sandbox](#what-the-sandbox-looks-like-inside)
+- [MCP and Skills](#mcp-and-skills)
+- [Conda support](#conda-support)
 - [Security model](#security-model)
 - [Recommended Kimi configuration](#recommended-kimi-configuration)
 - [Development](#development)
@@ -276,6 +278,8 @@ Everything after a `--` separator is passed through to `kimi` unchanged.
 | --- | --- | --- |
 | `/workspace` | your project | read-write (read-only with `--read-only`) |
 | `/kimi-code-home` | profile state dir | read-write |
+| `/kimi-code-home/skills` | host skill dir (via `profile_ro_mounts`) | read-only |
+| `/home/sandbox/.kimi-code` | symlink → `/kimi-code-home` (`compat_kimi_home`) | — |
 | `/cache` | profile cache dir | read-write (only with `--persistent-cache`) |
 | `/home/sandbox` | tmpfs (`HOME`) | read-write, ephemeral |
 | `/tmp`, `/run` | tmpfs | read-write, ephemeral |
@@ -307,10 +311,432 @@ forwarded, plus the launcher-controlled markers and a fixed `PATH`. Credentials
 and agent sockets (`*_API_KEY`, `AWS_*`, `GITHUB_TOKEN`, `SSH_AUTH_SOCK`, …) are
 never forwarded. Verify from within Kimi's `Bash`: `echo $KIMI_SANDBOX`.
 
+## MCP and Skills
+
+The sandbox can make your existing MCP servers and Kimi skills available
+**without copying anything into the project**. Their source, scripts and
+runtimes are bind-mounted **read-only** from their current host locations;
+inside the sandbox Kimi, Bash, hooks and MCP subprocesses can read and execute
+them but cannot modify them. Writable state stays separate: profile config and
+credentials in `/kimi-code-home`, caches in `/cache`, scratch in `/tmp`.
+
+Everything is driven from the default config so that, after a one-time setup,
+plain `kimi-sandbox .` "just works":
+
+```bash
+kimi-sandbox init-integrations          # print a suggested config (dry-run)
+kimi-sandbox init-integrations --write  # create ~/.config/kimi-sandbox/config.toml
+kimi-sandbox doctor --config-check      # validate config + mount plan
+kimi-sandbox .                          # run with MCP + skills mounted
+```
+
+### Config keys
+
+- `profile_ro_mounts` — read-only sub-mounts under `/kimi-code-home`, written as
+  `HOST:RELATIVE_TARGET`. Used to expose a skill directory at
+  `/kimi-code-home/skills`. The target is confined to a `..`-free relative path;
+  it can never escape the profile tree.
+- `ro_mounts` — read-only mounts for MCP source and language runtimes, mounted
+  under `/opt/...` (e.g. `/opt/kimi-mcp/...`, `/opt/kimi-runtime/...`).
+- `env_keep` — host variables to forward **explicitly** (e.g. a token). Nothing
+  sensitive is forwarded by default; no globbing.
+- `env_set` — fixed environment values from config.
+- `compat_kimi_home` — when true (default), `/home/sandbox/.kimi-code` is a
+  symlink to `/kimi-code-home`, so tools that probe `~/.kimi-code` still resolve
+  to the persistent profile. Toggle with `--compat-kimi-home` /
+  `--no-compat-kimi-home`.
+- `conda_enabled` / `conda_root` / `conda_writable` / `conda_shell_integration`
+  / `conda_existing_envs` — controlled conda integration (see
+  [Conda support](#conda-support)). The host conda root is mounted read-only;
+  new envs are created in `/cache/conda` (or `/tmp/kimi-conda`).
+
+`env_keep` / `env_set` may **not** override launcher-reserved variables (`HOME`,
+`PATH`, `KIMI_CODE_HOME`, `TMPDIR`, `XDG_*`, `KIMI_SANDBOX*`, and — when conda is
+enabled — `CONDARC`, `CONDA_ENVS_PATH`, `CONDA_PKGS_DIRS`, `BASH_ENV`, the
+`KIMI_SANDBOX_CONDA_*` anchors); attempting to do so is a hard error. For the
+cache location use `persistent_cache = true`, not an `XDG_CACHE_HOME` override.
+
+### Example `config.toml`
+
+```toml
+profile = "default"
+persistent_cache = true
+compat_kimi_home = true
+
+profile_ro_mounts = [
+  "~/.kimi-code/skills:skills",
+]
+
+ro_mounts = [
+  "~/mcp/github_mcp:/opt/kimi-mcp/github_mcp",
+  "~/miniconda3/envs/github-mcp:/opt/kimi-runtime/github-mcp",
+]
+
+env_keep = [
+  "GITHUB_TOKEN",
+]
+
+[env_set]
+PYTHONDONTWRITEBYTECODE = "1"
+KIMI_SANDBOX_MCP_ROOT = "/opt/kimi-mcp"
+```
+
+### Skill dotenv files
+
+Do not put API keys or other secret values directly in a skill's `SKILL.md` or
+in Kimi prompt text. If a skill-backed tool reads a dotenv file from its source
+tree or from a host config directory, expose that file to the sandbox with a
+read-only mount and point the tool at the in-sandbox path with `env_set`.
+
+This is useful for tools such as `imagegencli_codex`: the sandbox uses an
+isolated `HOME=/home/sandbox`, so a host file like
+`~/.config/imagegencli_codex/.env` is not visible unless you mount it explicitly.
+Mount the dotenv file under `/opt` and set the tool's env-file variable:
+
+```toml
+ro_mounts = [
+  "~/skills/imagegencli_codex/.env:/opt/imagegencli_codex.env",
+]
+
+[env_set]
+IMAGEGENCLI_CODEX_ENV_FILE = "/opt/imagegencli_codex.env"
+```
+
+Keep the mount read-only, avoid logging the file contents, and verify presence
+without printing the secret:
+
+```bash
+kimi-sandbox doctor --config-check
+kimi-sandbox . --exec 'test -r /opt/imagegencli_codex.env'
+kimi-sandbox . --exec 'conda run -n imagegencli_codex imagegencli_codex doctor'
+```
+
+### MCP server config must use in-sandbox paths
+
+The Kimi MCP config (verified layout: `~/.kimi-code/mcp.json`, schema
+`{"mcpServers": {<name>: {...}}}`) must reference **sandbox** paths, not host
+paths, unless the host path is mounted to the same location:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "/opt/kimi-runtime/github-mcp/bin/python",
+      "args": ["/opt/kimi-mcp/github_mcp/server.py"],
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "MCP_CACHE_DIR": "/cache/github-mcp"
+      }
+    }
+  }
+}
+```
+
+The launcher does **not** auto-write this file: confirm your installed Kimi's
+MCP config format, then edit `mcp.json` in the sandbox profile by hand
+(`~/.local/state/kimi-sandbox/profiles/<profile>/kimi-code-home/mcp.json`).
+`doctor` reports whether it can recognize the layout but never treats an
+unrecognized one as a launcher failure.
+
+### Write conventions (so read-only mounts stay read-only)
+
+- MCP source (`/opt/kimi-mcp/...`) and runtimes (`/opt/kimi-runtime/...`) must
+  not be written to: no logs, caches, databases or `.pyc`.
+- Set `PYTHONDONTWRITEBYTECODE=1` to stop Python writing `__pycache__` into the
+  read-only source.
+- Redirect runtime caches into `/cache/<server>` (or `/tmp`), never into the
+  runtime mount. Choose only what each server needs:
+
+```toml
+persistent_cache = true
+
+[env_set]
+PYTHONDONTWRITEBYTECODE = "1"
+PIP_CACHE_DIR = "/cache/pip"
+UV_CACHE_DIR = "/cache/uv"
+NPM_CONFIG_CACHE = "/cache/npm"
+HF_HOME = "/cache/huggingface"
+TORCH_HOME = "/cache/torch"
+```
+
+- Server-level persistent cache → `/cache/<server>`; profile-level state →
+  `/kimi-code-home/mcp-state/<server>`; scratch → `/tmp`.
+
+Use `/cache/<server>` for data you are happy to lose/rebuild, and
+`/kimi-code-home/mcp-state/<server>` for state that must survive across runs and
+travel with the profile (small databases, indexes, registration files). Both
+live on writable mounts, so the read-only MCP source stays untouched. Point each
+server at these from its MCP `env` block:
+
+```json
+{
+  "mcpServers": {
+    "github": {
+      "command": "/opt/kimi-runtime/github-mcp/bin/python",
+      "args": ["/opt/kimi-mcp/github_mcp/server.py"],
+      "env": {
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "MCP_CACHE_DIR": "/cache/github-mcp",
+        "MCP_STATE_DIR": "/kimi-code-home/mcp-state/github-mcp"
+      }
+    }
+  }
+}
+```
+
+`/cache` is only present when `persistent_cache = true`; `mcp-state` lives under
+the always-writable profile home, so it needs no extra flag. Create the
+subdirectory from the server itself (e.g. `os.makedirs(..., exist_ok=True)`) —
+the launcher does not pre-create per-server cache/state dirs.
+
+### Verify
+
+```bash
+# Skill dir is readable but not writable inside the sandbox:
+kimi-sandbox . --exec \
+  'test -r /kimi-code-home/skills && ! touch /kimi-code-home/skills/.w'
+
+# A minimal MCP source runs, stays read-only, and writes its cache to /cache:
+kimi-sandbox . --exec \
+  'python3 /opt/kimi-mcp/fake/fake_server.py && ! touch /opt/kimi-mcp/fake/.w'
+```
+
+Do **not** mount your real `~/.kimi-code` writable into the sandbox; use a
+`profile_ro_mounts` entry for just the skill directory instead.
+
+### `doctor` and `init-integrations` notes
+
+- `doctor --config-check` validates the config and the dry-run mount plan. It
+  treats advisory issues as `WARN` (never a failure): a recognized-but-unknown
+  Kimi layout, an empty `skills/` mountpoint, runtime mounts without a cache
+  redirect, MCP commands whose paths are not covered by any configured mount
+  target, and any `rw_mounts` (writable mounts are flagged because the
+  integration model is read-only). Hard problems (unparseable config, missing
+  or invalid mount sources) fail with a non-zero exit. The advisory symlink
+  scan of skill sources is bounded by default; pass `doctor --deep` for an
+  exhaustive scan of very large skill trees.
+- `init-integrations` is dry-run by default; `--write` creates a missing config
+  or appends only **entirely absent** top-level keys (after a timestamped
+  backup). When a list key such as `profile_ro_mounts` already exists but is
+  missing a suggested item, it does not edit the array — it prints the exact
+  item(s) to add by hand. A comment-preserving in-place array merge is deferred
+  to v2.
+
+### Worked example: bringing existing MCP servers + skills into the sandbox
+
+The sandbox runs Kimi with its **own** profile home, so its MCP servers and
+skills must be described in terms of *in-sandbox* paths. The recipe below is the
+exact process used to wire a real multi-server setup; replace `~/...` and the
+example names with your own.
+
+**1. Install the launcher activation-free** (see [Install](#install)) and confirm
+`kimi-sandbox --version` works from any directory:
+
+```bash
+ln -s "$(pwd)/.venv/bin/kimi-sandbox" ~/.local/bin/kimi-sandbox   # or use pipx
+kimi-sandbox --version
+```
+
+**2. Inventory what your host Kimi uses.** Look at `~/.kimi-code/mcp.json`
+(server commands + any path-valued `env`) and `~/.kimi-code/skills/` (usually
+symlinks to real skill dirs). For each server, note its **interpreter** and
+**source** — that determines how to relocate it (see the cheat sheet below).
+
+**3. Write `~/.config/kimi-sandbox/config.toml`.** Mount every host path a server
+needs read-only under `/opt`, enable conda if any server uses a conda env, and
+expose skills under `/kimi-code-home/skills`:
+
+```toml
+profile = "default"
+persistent_cache = true
+compat_kimi_home = true
+
+# Enable if any MCP server runs from a conda env. Binds the host conda root
+# read-only at its real path, so a "conda env interpreter" command resolves.
+conda_enabled = true
+conda_root = "~/anaconda3"
+conda_writable = "cache"
+conda_shell_integration = true
+
+ro_mounts = [
+  # MCP source trees (each contains the server's venv + code)
+  "~/mcp/servers:/opt/kimi-mcp/servers",
+  # an editable package's real source (cheat sheet: "editable install")
+  "~/projects/math-mcp/src:/opt/kimi-mcp/math-mcp-src",
+  # a non-system interpreter that a venv points at (cheat sheet: "uv / pyenv")
+  "~/.local/share/uv/python:/opt/kimi-mcp/uv-python",
+]
+
+# Skills exposed at /kimi-code-home/skills/<name> (read-only). Point at the REAL
+# skill directories, not the ~/.kimi-code/skills symlinks.
+profile_ro_mounts = [
+  "~/skills/bizplan-writer:skills/bizplan-writer",
+  "~/skills/canvas:skills/canvas",
+]
+
+[env_set]
+PYTHONDONTWRITEBYTECODE = "1"   # do not write __pycache__ into read-only /opt
+```
+
+> If the sandbox profile's `skills/` already contains stale symlinks from a
+> previous setup, remove them first (`find ~/.local/state/kimi-sandbox/profiles/\
+> default/kimi-code-home/skills -maxdepth 1 -type l -delete`) — the launcher
+> must create real-directory mountpoints, and `doctor` flags a symlinked
+> mountpoint as a failure.
+
+**4. Generate the sandbox `mcp.json`.** It lives in the sandbox **profile home**,
+not your real `~/.kimi-code`, and must use in-sandbox paths. The simplest way is
+to transform the host file: rewrite host prefixes to their `/opt` targets, add
+`PYTHONPATH` for editable installs, and keep secret env values verbatim:
+
+```python
+# write_sandbox_mcp.py  (run with any python3; prints no secret values)
+import json, os
+HOST = os.path.expanduser("~/.kimi-code/mcp.json")
+SBX  = os.path.expanduser(
+    "~/.local/state/kimi-sandbox/profiles/default/kimi-code-home/mcp.json")
+os.makedirs(os.path.dirname(SBX), mode=0o700, exist_ok=True)
+
+# host path prefix -> in-sandbox ro_mounts target
+REWRITE = {os.path.expanduser("~/mcp/servers"): "/opt/kimi-mcp/servers"}
+# servers installed with `pip install -e .` need their source on PYTHONPATH
+# (the .pth in the venv hard-codes a host path that is absent in the sandbox)
+PYTHONPATH = {"math": "/opt/kimi-mcp/math-mcp-src"}
+
+def rw(s):
+    if isinstance(s, str):
+        for h, o in REWRITE.items():
+            s = s.replace(h, o)
+    return s
+
+cfg = json.load(open(HOST))
+out = {"mcpServers": {}}
+for name, spec in cfg["mcpServers"].items():
+    spec = dict(spec)
+    spec["command"] = rw(spec.get("command"))
+    spec["args"] = [rw(a) for a in spec.get("args", [])]
+    env = {k: rw(v) for k, v in (spec.get("env") or {}).items()}  # keeps secrets
+    if name in PYTHONPATH:
+        env["PYTHONPATH"] = PYTHONPATH[name]
+    if env:
+        spec["env"] = env
+    out["mcpServers"][name] = spec
+
+json.dump(out, open(SBX, "w"), indent=2)
+os.chmod(SBX, 0o600)
+```
+
+**5. Validate, then probe each server inside the sandbox.**
+
+```bash
+kimi-sandbox doctor          # expect: 0 failed, 0 warning(s)
+
+# Confirm every server's interpreter + deps import inside the box, e.g.:
+mkdir -p /tmp/probe
+kimi-sandbox /tmp/probe --exec \
+  'PYTHONPATH=/opt/kimi-mcp/math-mcp-src \
+   conda run -n math python -c "import math_mcp; print(\"ok\")"'
+kimi-sandbox /tmp/probe --exec 'ls /kimi-code-home/skills'   # skills present
+```
+
+**6. Run it.** `kimi-sandbox .` now starts Kimi with the servers and skills. The
+sandbox profile is separate from your real `~/.kimi-code`, so log in once inside
+the sandbox; that login persists across runs in the per-profile state dir.
+
+#### Interpreter relocation cheat sheet
+
+The one thing that breaks "it works on the host but not in the sandbox" is a path
+baked into a venv/interpreter that is not mounted. Match your server to a row:
+
+| Server's interpreter / install | What it needs in the sandbox |
+|---|---|
+| venv on the **system** `python3` (`/usr/bin/python3`) | Mount the source tree under `/opt`; the venv runs from its `/opt` path as-is (system python is already mounted read-only). |
+| venv on a **uv / pyenv** python | Also mount that interpreter (e.g. `~/.local/share/uv/python`) and run it **directly** (`<interp> -m <module>`) with `PYTHONPATH` = venv `site-packages` + source — the venv's own `python` symlink points at an unmounted host path. |
+| **conda env** interpreter | Set `conda_enabled = true`; the conda root is bound at its real path, so `<conda>/envs/<env>/bin/python` (or `conda run -n <env>`) resolves. New envs go to `/cache/conda`. |
+| **editable** install (`pip install -e`) | Mount the real source and add it to that server's `PYTHONPATH`; the `.pth` in site-packages hard-codes a host path that is absent in the sandbox. |
+| command/args/env naming **host paths** | Rewrite them to the `/opt` mount targets in the sandbox `mcp.json`. |
+
+`doctor` confirms each mount source exists, that the recognized Kimi layout uses
+sandbox (`/opt/...`) paths, and (when conda is enabled) that the conda setup is
+valid — all without launching the Kimi TUI. Your real `~/.kimi-code` is never
+mounted writable.
+
+## Conda support
+
+`kimi-sandbox` can expose your existing conda to the sandbox while keeping every
+pre-existing host conda env strictly read-only. Enable it in the config:
+
+```toml
+persistent_cache = true
+conda_enabled = true
+conda_root = "~/anaconda3"
+conda_writable = "cache"          # new envs/pkgs go to /cache/conda; "tmp" = ephemeral
+conda_shell_integration = true    # enables `conda activate` in bash -lc
+
+# Optional extra existing envs that live outside conda_root/envs:
+# conda_existing_envs = ["~/somewhere/envs/foo:foo"]
+```
+
+Inside the sandbox, `conda` then works directly:
+
+```bash
+conda --version
+conda env list
+conda run -n math-mcp python -m math_mcp
+conda activate math-mcp && python ...        # needs conda_shell_integration = true
+conda create -n sandbox-dev python=3.11      # -> /cache/conda/envs/sandbox-dev
+```
+
+Recommended MCP server forms:
+
+```json
+{ "command": "conda", "args": ["run", "-n", "math-mcp", "python", "-m", "math_mcp"] }
+```
+
+```json
+{ "command": "bash", "args": ["-lc", "conda activate math-mcp && python -m math_mcp"] }
+```
+
+### What is read-only vs writable
+
+| Content | Mode |
+|---|---|
+| Host conda root + existing envs/packages | read-only (`/opt/kimi-conda/root` + original path) |
+| New envs / downloaded packages | writable (`/cache/conda` or `/tmp/kimi-conda`) |
+| `conda` entry point | launcher-generated shim at `/sandbox/bin/conda` |
+
+These therefore **fail** by design (host envs are read-only):
+
+```bash
+conda install -n existing-env some-package   # rejected by the shim; FS is read-only
+conda env remove -n existing-env             # rejected
+rm -rf /opt/kimi-conda/root/envs/existing    # read-only filesystem
+```
+
+The shim parses the full conda argv (including `--json`, `--name=`, `--prefix`,
+`env update -f environment.yml`, and unambiguous option abbreviations like
+`--pre`) and refuses any mutation that does not provably target
+`/cache/conda/envs/<name>`. `conda config` allows only read-only queries
+(`--show`/`--get`/...); `conda clean` is limited to the writable package cache
+(`--force-pkgs-dirs` is refused). The original host conda root is also bound at
+its real absolute path so console-script shebangs (`#!/home/you/anaconda3/...`)
+keep resolving. Run `kimi-sandbox doctor` to validate the whole conda setup.
+
+> **The shim is a convenience layer, not the security boundary.** Host conda
+> content is protected by the read-only bind mounts plus the launcher-forced
+> `CONDA_ENVS_PATH`/`CONDA_PKGS_DIRS`, which hold even if the shim is bypassed
+> (e.g. by invoking the real conda binary directly, or after `conda activate`,
+> which re-exports `CONDA_EXE` back to the real binary). A `conda install`
+> against a host env therefore *fails* either way — early via the shim, or at
+> the filesystem layer — and never modifies host content.
+
+> New envs created with `conda_writable = "tmp"` do **not** persist across
+> sandbox runs. With `no_network = true`, `conda create/install` can only use
+> already-available local channels/cache.
+
 ## Security model
 
 ### Protects against (filesystem damage containment)
-
 - Kimi or its shell commands writing to `/etc` or other system dirs.
 - Kimi touching other projects in your home directory.
 - Commands writing to the host `/tmp`.
@@ -376,6 +802,15 @@ never forwarded. Verify from within Kimi's `Bash`: `echo $KIMI_SANDBOX`.
   tool subprocesses via a credential broker; this is not implemented.
 - `/dev/shm` inside the sandbox is a writable (but per-namespace, ephemeral)
   tmpfs from bubblewrap's default device set; it cannot affect the host.
+- **Conda mutation policy is not the boundary.** When conda is enabled, the
+  generated `/sandbox/bin/conda` shim rejects mutations of read-only host envs
+  *early* and with a clear message, but it is a convenience/early-rejection
+  layer only. The real conda binary stays directly reachable inside the sandbox
+  (e.g. `/opt/kimi-conda/root/bin/conda`), so the guarantee that host envs and
+  packages cannot be modified comes from the **read-only bind mounts** plus the
+  launcher-forced `CONDA_ENVS_PATH`/`CONDA_PKGS_DIRS`/`CONDARC` (which steer all
+  writes into the sandbox-writable area). Those hold even if the shim is bypassed
+  entirely. Do not rely on the shim's argv parsing for isolation.
 - **Privileges and capabilities.** The launcher runs unprivileged and relies on
   bubblewrap's unprivileged user namespace. Any capabilities a sandboxed process
   holds exist only inside that user namespace and map to *nobody* on the host,

@@ -228,3 +228,129 @@ def test_merged_usr_layout(tmp_path, monkeypatch):
         if tok == "--ro-bind":
             ro_pairs.append((args[i + 1], args[i + 2]))
     assert ("/usr", "/usr") in ro_pairs
+
+
+# --- controlled conda mounts (mod_v2 §12) --------------------------------
+
+from kimi_sandbox.config import (  # noqa: E402
+    CondaConfig,
+    CondaExistingEnv,
+    GeneratedFileMount,
+)
+
+
+def _make_conda(tmp_path, *, writable="/cache/conda", existing=()):
+    root = tmp_path / "anaconda3"
+    (root / "bin").mkdir(parents=True, exist_ok=True)
+    return CondaConfig(
+        root=root.resolve(),
+        sandbox_original_root=str(root.resolve()),
+        writable_root=writable,
+        shell_integration=True,
+        existing_envs=existing,
+    )
+
+
+def _gen_mounts(tmp_path):
+    shim = tmp_path / "g" / "conda"
+    rc = tmp_path / "g" / "condarc"
+    be = tmp_path / "g" / "conda-bash-env"
+    (tmp_path / "g").mkdir(exist_ok=True)
+    for f in (shim, rc, be):
+        f.write_text("x")
+    return (
+        GeneratedFileMount(source=shim, target="/sandbox/bin/conda", executable=True),
+        GeneratedFileMount(source=rc, target="/sandbox/etc/condarc"),
+        GeneratedFileMount(source=be, target="/sandbox/etc/conda-bash-env"),
+    )
+
+
+def test_conda_root_ro_bound_canonical_and_original(tmp_path):
+    conda = _make_conda(tmp_path)
+    cfg = make_config(tmp_path, conda=conda, generated_file_mounts=_gen_mounts(tmp_path),
+                      cache_dir=(tmp_path / "cache").resolve())
+    (tmp_path / "cache").mkdir(exist_ok=True)
+    cmd = build_bwrap_command(cfg)
+    ro = _pairs(cmd, "--ro-bind")
+    assert (str(conda.root), "/opt/kimi-conda/root") in ro
+    assert (str(conda.root), conda.sandbox_original_root) in ro
+
+
+def test_conda_existing_env_ro_bound(tmp_path):
+    env_src = tmp_path / "extra" / "envs" / "foo"
+    env_src.mkdir(parents=True)
+    conda = _make_conda(
+        tmp_path,
+        existing=(CondaExistingEnv(source=env_src.resolve(), name="foo"),),
+    )
+    cfg = make_config(tmp_path, conda=conda, generated_file_mounts=_gen_mounts(tmp_path))
+    cmd = build_bwrap_command(cfg)
+    ro = _pairs(cmd, "--ro-bind")
+    assert (str(env_src.resolve()), "/opt/kimi-conda/existing-envs/foo") in ro
+    assert (str(env_src.resolve()), str(env_src.resolve())) in ro
+
+
+def test_conda_generated_files_ro_bound(tmp_path):
+    conda = _make_conda(tmp_path)
+    gen = _gen_mounts(tmp_path)
+    cfg = make_config(tmp_path, conda=conda, generated_file_mounts=gen)
+    cmd = build_bwrap_command(cfg)
+    ro = _pairs(cmd, "--ro-bind")
+    assert (str(gen[0].source), "/sandbox/bin/conda") in ro
+    assert (str(gen[1].source), "/sandbox/etc/condarc") in ro
+    assert "--dir" in cmd and "/sandbox/etc" in cmd
+
+
+def test_conda_tmp_writable_creates_tmp_dir(tmp_path):
+    conda = _make_conda(tmp_path, writable="/tmp/kimi-conda")
+    cfg = make_config(tmp_path, conda=conda, generated_file_mounts=_gen_mounts(tmp_path))
+    cmd = build_bwrap_command(cfg)
+    dirs = [cmd[i + 1] for i, t in enumerate(cmd) if t == "--dir"]
+    assert "/tmp/kimi-conda" in dirs
+    assert "/tmp/kimi-conda/envs" in dirs
+
+
+def test_conda_root_fd_pinned(tmp_path):
+    conda = _make_conda(tmp_path)
+    cfg = make_config(tmp_path, conda=conda, generated_file_mounts=_gen_mounts(tmp_path))
+    cmd = build_bwrap_command(cfg, path_fds={str(conda.root): 21})
+    # fd-pinned ro bind used for the canonical conda root.
+    assert (("21", "/opt/kimi-conda/root") in _pairs(cmd, "--ro-bind-fd"))
+
+
+def test_no_conda_no_opt_mounts(tmp_path):
+    cmd = build_bwrap_command(make_config(tmp_path))
+    assert "/opt/kimi-conda/root" not in cmd
+    assert "/sandbox/etc" not in cmd
+
+
+# --- audit #6: original-prefix alias bind uses a distinct pinned fd ----------
+
+def test_conda_original_alias_uses_distinct_fd(tmp_path):
+    from kimi_sandbox.config import CONDA_ALIAS_FD_SUFFIX
+
+    conda = _make_conda(tmp_path)
+    cfg = make_config(tmp_path, conda=conda, generated_file_mounts=_gen_mounts(tmp_path))
+    canonical_fd = 30
+    alias_fd = 31
+    path_fds = {
+        str(conda.root): canonical_fd,
+        str(conda.root) + CONDA_ALIAS_FD_SUFFIX: alias_fd,
+    }
+    cmd = build_bwrap_command(cfg, path_fds=path_fds)
+    ro_fd = _pairs(cmd, "--ro-bind-fd")
+    # canonical bind uses fd 30 at the canonical path, alias uses fd 31 at the
+    # original path -> the same fd is never emitted twice (bwrap closes it).
+    assert (str(canonical_fd), "/opt/kimi-conda/root") in ro_fd
+    assert (str(alias_fd), conda.sandbox_original_root) in ro_fd
+    fds_used = [fd for fd, _ in ro_fd]
+    assert fds_used.count(str(canonical_fd)) == 1
+
+
+def test_conda_alias_falls_back_to_path_bind_without_fd(tmp_path):
+    conda = _make_conda(tmp_path)
+    cfg = make_config(tmp_path, conda=conda, generated_file_mounts=_gen_mounts(tmp_path))
+    # No path_fds (e.g. --dry-run): alias uses a plain path ro-bind.
+    cmd = build_bwrap_command(cfg)
+    ro = _pairs(cmd, "--ro-bind")
+    assert (str(conda.root), conda.sandbox_original_root) in ro

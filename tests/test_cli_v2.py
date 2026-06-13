@@ -6,11 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from kimi_sandbox import cli
-from kimi_sandbox import seccomp
+from kimi_sandbox import cli, seccomp
 from kimi_sandbox.config import ResourceLimits
 from kimi_sandbox.errors import SandboxError
-
 
 # --- load_config_file ----------------------------------------------------
 
@@ -499,3 +497,329 @@ def test_dry_run_shows_paths_not_fds(tmp_path, capsys, monkeypatch):
     assert "--bind-fd" not in captured.out      # readable path form in dry-run
     assert f"--bind {project.resolve()} /workspace" in captured.out
     assert "pinned via --bind-fd" in captured.err
+
+
+# --- Patch 1: conda config schema ----------------------------------------
+
+def test_conda_keys_are_known():
+    for key in (
+        "conda_enabled",
+        "conda_shell_integration",
+        "conda_root",
+        "conda_writable",
+        "conda_existing_envs",
+    ):
+        assert key in cli._CONFIG_KNOWN_KEYS
+
+
+def test_conda_default_disabled(tmp_path):
+    cfg = tmp_path / "c.toml"
+    cfg.write_text('profile = "default"\n')
+    data = cli.load_config_file(cfg, explicit=True)
+    assert "conda_enabled" not in data
+    assert cli._pick(None, data, "conda_enabled", False) is False
+
+
+def test_conda_config_keys_accepted(tmp_path):
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(
+        "conda_enabled = true\n"
+        'conda_root = "~/anaconda3"\n'
+        'conda_writable = "cache"\n'
+        "conda_shell_integration = true\n"
+        'conda_existing_envs = ["~/x/envs/foo:foo"]\n'
+    )
+    data = cli.load_config_file(cfg, explicit=True)
+    assert data["conda_enabled"] is True
+    assert data["conda_root"] == "~/anaconda3"
+    assert data["conda_writable"] == "cache"
+    assert data["conda_shell_integration"] is True
+    assert data["conda_existing_envs"] == ["~/x/envs/foo:foo"]
+
+
+def test_conda_enabled_wrong_type_rejected(tmp_path):
+    cfg = tmp_path / "c.toml"
+    cfg.write_text('conda_enabled = "yes"\n')
+    with pytest.raises(SandboxError):
+        cli.load_config_file(cfg, explicit=True)
+
+
+def test_conda_root_wrong_type_rejected(tmp_path):
+    cfg = tmp_path / "c.toml"
+    cfg.write_text("conda_root = 123\n")
+    with pytest.raises(SandboxError):
+        cli.load_config_file(cfg, explicit=True)
+
+
+def test_conda_existing_envs_wrong_type_rejected(tmp_path):
+    cfg = tmp_path / "c.toml"
+    cfg.write_text("conda_existing_envs = [1, 2]\n")
+    with pytest.raises(SandboxError):
+        cli.load_config_file(cfg, explicit=True)
+
+
+# --- Patch 5/6/7: conda env, reserved keys, runtime assembly --------------
+
+from kimi_sandbox.config import (  # noqa: E402
+    CondaConfig,
+    SandboxConfig,
+)
+
+
+def _conda_cfg(tmp_path, **over):
+    root = tmp_path / "anaconda3"
+    (root / "bin").mkdir(parents=True, exist_ok=True)
+    base = dict(
+        root=root.resolve(),
+        sandbox_original_root=str(root.resolve()),
+        writable_root="/cache/conda",
+        shell_integration=True,
+        existing_envs=(),
+    )
+    base.update(over)
+    return CondaConfig(**base)
+
+
+def test_env_conda_keys_set(tmp_path):
+    env = cli.build_env_allowlist(conda=_conda_cfg(tmp_path))
+    assert env["CONDARC"] == "/sandbox/etc/condarc"
+    assert env["CONDA_ENVS_PATH"].startswith("/cache/conda/envs:")
+    assert env["CONDA_PKGS_DIRS"] == "/cache/conda/pkgs"
+    assert env["CONDA_ALWAYS_COPY"] == "1"
+    assert env["KIMI_SANDBOX_CONDA_ORIGINAL_ROOT"] == str(tmp_path / "anaconda3")
+    assert env["BASH_ENV"] == "/sandbox/etc/conda-bash-env"
+
+
+def test_env_conda_envs_path_writable_first(tmp_path):
+    env = cli.build_env_allowlist(conda=_conda_cfg(tmp_path))
+    parts = env["CONDA_ENVS_PATH"].split(":")
+    assert parts[0] == "/cache/conda/envs"
+
+
+def test_env_no_bash_env_without_shell_integration(tmp_path):
+    env = cli.build_env_allowlist(conda=_conda_cfg(tmp_path, shell_integration=False))
+    assert "BASH_ENV" not in env
+
+
+def test_env_set_cannot_override_conda_envs_path(tmp_path):
+    with pytest.raises(SandboxError):
+        cli.build_env_allowlist(
+            conda=_conda_cfg(tmp_path), env_set={"CONDA_ENVS_PATH": "/evil"}
+        )
+
+
+def test_env_set_cannot_override_original_root(tmp_path):
+    with pytest.raises(SandboxError):
+        cli.build_env_allowlist(
+            conda=_conda_cfg(tmp_path),
+            env_set={"KIMI_SANDBOX_CONDA_ORIGINAL_ROOT": "/evil"},
+        )
+
+
+def test_env_keep_cannot_keep_bash_env(tmp_path):
+    with pytest.raises(SandboxError):
+        cli.build_env_allowlist(conda=_conda_cfg(tmp_path), env_keep=["BASH_ENV"])
+
+
+def test_conda_keys_not_reserved_without_conda():
+    # Without conda, CONDA_ENVS_PATH is just a normal user var.
+    env = cli.build_env_allowlist(env_set={"CONDA_ENVS_PATH": "/whatever"})
+    assert env["CONDA_ENVS_PATH"] == "/whatever"
+
+
+def _make_fake_conda_root(tmp_path):
+    root = tmp_path / "anaconda3"
+    (root / "bin").mkdir(parents=True)
+    exe = root / "bin" / "conda"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    (root / "envs" / "existing" / "bin").mkdir(parents=True)
+    return root
+
+
+@pytest.fixture
+def home_conda_root():
+    """A fake conda root under $HOME (outside the reserved /tmp compat path)."""
+    import os
+    import shutil
+    import tempfile
+
+    base = Path(tempfile.mkdtemp(dir=os.path.expanduser("~"), prefix="kimitest_"))
+    root = base / "anaconda3"
+    (root / "bin").mkdir(parents=True)
+    exe = root / "bin" / "conda"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    (root / "envs" / "existing" / "bin").mkdir(parents=True)
+    try:
+        yield base, root
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+
+
+def test_build_conda_runtime_disabled_returns_none(tmp_path):
+    conda, gen = cli.build_conda_runtime(
+        {}, project_dir=tmp_path / "p", state_root=tmp_path / "s",
+        kimi_code_home=tmp_path / "k", cache_dir=None, persistent_cache=False,
+        profile="default",
+    )
+    assert conda is None and gen == ()
+
+
+def test_build_conda_runtime_cache_requires_persistent(home_conda_root):
+    base, root = home_conda_root
+    with pytest.raises(SandboxError, match="persistent_cache"):
+        cli.build_conda_runtime(
+            {"conda_enabled": True, "conda_root": str(root), "conda_writable": "cache"},
+            project_dir=base / "p", state_root=base / "s",
+            kimi_code_home=base / "k", cache_dir=None, persistent_cache=False,
+            profile="default",
+        )
+
+
+def test_build_conda_runtime_bad_writable(home_conda_root):
+    base, root = home_conda_root
+    with pytest.raises(SandboxError):
+        cli.build_conda_runtime(
+            {"conda_enabled": True, "conda_root": str(root), "conda_writable": "nope"},
+            project_dir=base / "p", state_root=base / "s",
+            kimi_code_home=base / "k", cache_dir=base / "c",
+            persistent_cache=True, profile="default",
+        )
+
+
+def test_build_conda_runtime_generates_files(home_conda_root):
+    base, root = home_conda_root
+    cache = base / "cache"
+    cache.mkdir()
+    conda, gen = cli.build_conda_runtime(
+        {"conda_enabled": True, "conda_root": str(root), "conda_writable": "cache"},
+        project_dir=base / "p", state_root=base / "state",
+        kimi_code_home=base / "k", cache_dir=cache, persistent_cache=True,
+        profile="default",
+    )
+    assert conda is not None
+    targets = {m.target for m in gen}
+    assert "/sandbox/bin/conda" in targets
+    assert (cache / "conda" / "envs").is_dir()
+
+
+def test_open_bind_fds_includes_conda_sources(tmp_path):
+    root = _make_fake_conda_root(tmp_path)
+    proj = tmp_path / "p"
+    proj.mkdir()
+    kimi = tmp_path / "kimi"
+    kimi.write_text("x")
+    kch = tmp_path / "k"
+    kch.mkdir()
+    shim = tmp_path / "shim"
+    shim.write_text("x")
+    from kimi_sandbox.config import GeneratedFileMount
+
+    conda = CondaConfig(
+        root=root.resolve(),
+        sandbox_original_root=str(root.resolve()),
+        writable_root="/cache/conda",
+        shell_integration=True,
+    )
+    cfg = SandboxConfig(
+        project_dir=proj.resolve(),
+        kimi_code_home=kch.resolve(),
+        kimi_path=kimi.resolve(),
+        inner_command=["/sandbox/bin/kimi"],
+        env={},
+        conda=conda,
+        generated_file_mounts=(
+            GeneratedFileMount(source=shim.resolve(), target="/sandbox/bin/conda"),
+        ),
+    )
+    fds = cli.open_bind_fds(cfg)
+    try:
+        assert str(root.resolve()) in fds
+        assert str(shim.resolve()) in fds
+        # The conda root is bound twice; the alias bind has its own pinned fd
+        # under the NUL-suffixed key (audit #6), distinct from the canonical fd.
+        from kimi_sandbox.config import CONDA_ALIAS_FD_SUFFIX
+
+        alias_key = str(root.resolve()) + CONDA_ALIAS_FD_SUFFIX
+        assert alias_key in fds
+        assert fds[alias_key] != fds[str(root.resolve())]
+    finally:
+        import os
+        for fd in fds.values():
+            os.close(fd)
+
+
+# --- Patch 8/9: doctor + init-integrations conda --------------------------
+
+def test_detect_conda_root_found(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    root = tmp_path / "anaconda3" / "bin"
+    root.mkdir(parents=True)
+    (root / "conda").write_text("#!/bin/sh\n")
+    (root / "conda").chmod(0o755)
+    assert cli.detect_conda_root() == "~/anaconda3"
+
+
+def test_detect_conda_root_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert cli.detect_conda_root() is None
+
+
+def test_init_template_includes_conda_block_when_detected():
+    out = cli._render_init_template([], conda_root="~/anaconda3")
+    assert "conda_enabled = true" in out
+    assert 'conda_root = "~/anaconda3"' in out
+    assert 'conda_writable = "cache"' in out
+
+
+def test_init_template_conda_commented_when_absent():
+    out = cli._render_init_template([], conda_root=None)
+    assert "# conda_enabled = true" in out
+
+
+def test_init_integrations_suggests_conda(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cli, "detect_conda_root", lambda: "~/anaconda3")
+    target = tmp_path / "c.toml"
+    target.write_text('compat_kimi_home = true\npersistent_cache = true\n')
+    rc = cli.main(["init-integrations", "--config", str(target)])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "conda_enabled = true" in out
+    assert 'conda_root = "~/anaconda3"' in out
+
+
+def _doctor_lines(cfg_text, tmp_path):
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(cfg_text)
+    return cli.main(["doctor", "--config", str(cfg)])
+
+
+def test_doctor_conda_cache_without_persistent_fails(home_conda_root, capsys):
+    base, root = home_conda_root
+    cfg = base / "c.toml"
+    cfg.write_text(
+        "conda_enabled = true\n"
+        f'conda_root = "{root}"\n'
+        'conda_writable = "cache"\n'
+    )
+    rc = cli.main(["doctor", "--config", str(cfg)])
+    err = capsys.readouterr().err
+    assert "persistent_cache" in err
+    assert rc != 0
+
+
+def test_doctor_conda_ok(home_conda_root, capsys):
+    base, root = home_conda_root
+    cfg = base / "c.toml"
+    cfg.write_text(
+        "persistent_cache = true\n"
+        "conda_enabled = true\n"
+        f'conda_root = "{root}"\n'
+        'conda_writable = "cache"\n'
+    )
+    rc = cli.main(["doctor", "--config", str(cfg)])
+    err = capsys.readouterr().err
+    assert "conda enabled" in err
+    assert "conda clean scope" in err
+    assert rc == 0

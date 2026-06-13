@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
 import pytest
 
@@ -19,7 +18,6 @@ from kimi_sandbox.paths import (
     resolve_unsafe_kimi_code_home,
     validate_path_relationships,
 )
-
 
 # --- resolve_project_dir -------------------------------------------------
 

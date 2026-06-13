@@ -28,10 +28,15 @@ import os
 from pathlib import Path
 
 from .config import (
+    CONDA_ALIAS_FD_SUFFIX,
     ETC_MIN_DIRS,
     ETC_MIN_FILES,
     MODE_READ_ONLY,
     SANDBOX_CACHE,
+    SANDBOX_CONDA_EXISTING_ENVS,
+    SANDBOX_CONDA_ROOT,
+    SANDBOX_CONDA_TMP_WRITABLE,
+    SANDBOX_ETC_DIR,
     SANDBOX_HOME,
     SANDBOX_KIMI_BIN_DIR,
     SANDBOX_KIMI_CODE_HOME,
@@ -101,6 +106,116 @@ def _bind_args(
     return [flag, source, dest]
 
 
+def _alias_bind_args(
+    *, source: str, dest: str, path_fds: dict[str, int] | None
+) -> list[str]:
+    """Emit a read-only bind for a *second* (alias) bind of ``source``.
+
+    The same host inode is bound twice (canonical + original-prefix path);
+    because bubblewrap closes each bind fd after use, the alias cannot reuse the
+    canonical fd. ``open_bind_fds`` pins a distinct fd under
+    ``source + CONDA_ALIAS_FD_SUFFIX``; we use it when present, otherwise fall
+    back to a plain path bind (e.g. ``--dry-run`` or ``--no-pin-mounts``).
+    """
+    if path_fds is not None:
+        fd = path_fds.get(source + CONDA_ALIAS_FD_SUFFIX)
+        if fd is not None:
+            return ["--ro-bind-fd", str(fd), dest]
+    return ["--ro-bind", source, dest]
+
+
+def _conda_mount_args(
+    config: SandboxConfig, *, path_fds: dict[str, int] | None
+) -> list[str]:
+    """Build the controlled-conda mounts (mod_v2 §12).
+
+    The host conda root and any extra existing envs are bound **read-only** at
+    two places each: the canonical ``/opt/kimi-conda/...`` path and the env's
+    *original* absolute host path (recreated inside the sandbox so hard-coded
+    console-script shebangs still resolve, §7.6). Only empty parent directories
+    are created for the original-path binds — the host parents are never bound.
+    The launcher-generated shim/condarc/bash-hook are bound read-only too. The
+    writable area is ``/cache/conda`` (already covered by the ``/cache`` bind)
+    or an ephemeral ``/tmp/kimi-conda`` tmpfs dir.
+    """
+    conda = config.conda
+    args: list[str] = []
+    if conda is None and not config.generated_file_mounts:
+        return args
+
+    # /sandbox/etc holds the generated condarc / bash hook.
+    args += ["--dir", SANDBOX_ETC_DIR]
+
+    if conda is not None:
+        # Parent scaffolding for the canonical read-only conda tree.
+        args += [
+            "--dir", "/opt",
+            "--dir", "/opt/kimi-conda",
+            "--dir", SANDBOX_CONDA_EXISTING_ENVS,
+        ]
+
+        # Host conda root: canonical + original-prefix, both read-only.
+        args += _bind_args(
+            source=str(conda.root),
+            dest=SANDBOX_CONDA_ROOT,
+            writable=False,
+            path_fds=path_fds,
+        )
+        original = conda.sandbox_original_root
+        if original and original != SANDBOX_CONDA_ROOT:
+            parent = os.path.dirname(original.rstrip("/"))
+            if parent and parent != "/":
+                args += ["--dir", parent]
+            # The original-prefix alias binds the *same* source inode a second
+            # time. bubblewrap closes each bind fd after use, so the alias gets
+            # its own pinned fd via the NUL-suffixed alias key (audit #6); if
+            # none was provided (e.g. --dry-run) it falls back to a path bind.
+            args += _alias_bind_args(
+                source=str(conda.root),
+                dest=original,
+                path_fds=path_fds,
+            )
+
+        # Extra existing envs: canonical + original-prefix, both read-only.
+        for env in conda.existing_envs:
+            canonical = f"{SANDBOX_CONDA_EXISTING_ENVS}/{env.name}"
+            args += _bind_args(
+                source=str(env.source),
+                dest=canonical,
+                writable=False,
+                path_fds=path_fds,
+            )
+            env_original = str(env.source)
+            parent = os.path.dirname(env_original.rstrip("/"))
+            if parent and parent != "/":
+                args += ["--dir", parent]
+            # Second bind of the same source -> its own pinned alias fd.
+            args += _alias_bind_args(
+                source=env_original,
+                dest=env_original,
+                path_fds=path_fds,
+            )
+
+        # Writable conda area. In "cache" mode this lives inside the already
+        # rw-bound /cache; in "tmp" mode we materialise an ephemeral tree.
+        if conda.writable_root == SANDBOX_CONDA_TMP_WRITABLE:
+            args += [
+                "--dir", SANDBOX_CONDA_TMP_WRITABLE,
+                "--dir", f"{SANDBOX_CONDA_TMP_WRITABLE}/envs",
+                "--dir", f"{SANDBOX_CONDA_TMP_WRITABLE}/pkgs",
+            ]
+
+    # Generated helper files (shim/condarc/bash hook), always read-only.
+    for mount in config.generated_file_mounts:
+        args += _bind_args(
+            source=str(mount.source),
+            dest=mount.target,
+            writable=False,
+            path_fds=path_fds,
+        )
+    return args
+
+
 def build_bwrap_command(
     config: SandboxConfig,
     *,
@@ -168,6 +283,12 @@ def build_bwrap_command(
     # --- sandbox bin dir for the kimi binary ---
     cmd += ["--dir", "/sandbox", "--dir", SANDBOX_KIMI_BIN_DIR]
 
+    # --- controlled conda integration (mod_v2 §12) ---
+    # Emitted right after /sandbox/bin so the generated shim lands on the
+    # already-created bin dir; read-only conda root/env binds and their
+    # original-prefix compatibility binds follow.
+    cmd += _conda_mount_args(config, path_fds=path_fds)
+
     # --- minimal read-only /etc ---
     cmd += _etc_mount_args()
 
@@ -188,6 +309,28 @@ def build_bwrap_command(
         writable=True,
         path_fds=path_fds,
     )
+
+    # --- profile read-only sub-mounts under /kimi-code-home (mod_v1 §10.1) ---
+    # These MUST come after the rw /kimi-code-home bind above: the parent is
+    # bound writable first, then each skills-style subdirectory is layered on
+    # top read-only. The launcher pre-creates each mountpoint in the host
+    # profile (prepare_profile_mount_targets), so bubblewrap has a real dir to
+    # bind onto.
+    for mount in config.profile_ro_mounts:
+        target = f"{SANDBOX_KIMI_CODE_HOME}/{mount.relative_target}"
+        cmd += _bind_args(
+            source=str(mount.source),
+            dest=target,
+            writable=False,
+            path_fds=path_fds,
+        )
+
+    # --- compat: /home/sandbox/.kimi-code -> /kimi-code-home (mod_v1 §10.3) ---
+    # Some Kimi plugins/tools probe the home-relative ~/.kimi-code path. The
+    # symlink makes that resolve to the persistent profile rather than the
+    # ephemeral tmpfs HOME. /home/sandbox already exists (--dir above).
+    if config.compat_kimi_home:
+        cmd += ["--symlink", SANDBOX_KIMI_CODE_HOME, f"{SANDBOX_HOME}/.kimi-code"]
 
     # --- optional persistent cache (design 31.4) ---
     if config.cache_dir is not None:
